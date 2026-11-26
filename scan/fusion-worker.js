@@ -1,4 +1,4 @@
-// Web Worker: recibe mapas de profundidad + poses, fusiona y devuelve mallas por supercelda.
+// Web Worker: recibe mapas de profundidad (+ color) y poses, fusiona y devuelve mallas por supercelda.
 import { Fusion } from './fusion-core.js';
 
 const MESH_INTERVAL_MS = 250;
@@ -9,7 +9,7 @@ let lastMesh = 0;
 
 function send(type, extra, meshes = []) {
   const transfer = [];
-  for (const m of meshes) transfer.push(m.positions.buffer, m.normals.buffer, m.indices.buffer);
+  for (const m of meshes) transfer.push(m.positions.buffer, m.normals.buffer, m.colors.buffer, m.indices.buffer);
   self.postMessage({ type, meshes, stats: fusion.stats(), ...extra }, transfer);
 }
 
@@ -17,12 +17,9 @@ self.onmessage = (ev) => {
   const m = ev.data;
   try {
     switch (m.type) {
-      case 'init':
-        fusion = new Fusion(m.options || {});
-        break;
-
       case 'reset':
-        fusion = new Fusion(fusion.opts);
+        fusion = new Fusion(m.options ?? fusion.opts);
+        lastMesh = 0;
         send('reset', {});
         break;
 
@@ -32,6 +29,7 @@ self.onmessage = (ev) => {
         const r = fusion.integrate({
           depth, width: m.width, height: m.height, rawToMeters: m.rawToMeters,
           normViewFromNormDepth: m.normViewFromNormDepth, projection: m.projection, viewMatrix: m.viewMatrix,
+          color: m.color ? new Uint8Array(m.color) : null, colorWidth: m.colorWidth, colorHeight: m.colorHeight,
         });
         const t1 = performance.now();
         let meshes = [];
@@ -44,16 +42,10 @@ self.onmessage = (ev) => {
       }
 
       case 'flush': {
-        // termina todo el mallado pendiente (al cerrar la sesión)
+        // malla final completa y limpia (al cerrar la sesión); reemplaza todo
         const t0 = performance.now();
-        let meshes = [];
-        for (let i = 0; i < 1000; i++) {
-          const r = fusion.extract(Infinity);
-          meshes = meshes.concat(r.meshes);
-          if (r.pending === 0) break;
-        }
-        const latest = [...new Map(meshes.map((x) => [x.key, x])).values()];
-        send('flushed', { meshMs: performance.now() - t0 }, latest);
+        const r = fusion.finalMeshes();
+        send('flushed', { meshMs: performance.now() - t0, removedTris: r.removedTris, replaceAll: true }, r.meshes);
         break;
       }
     }
