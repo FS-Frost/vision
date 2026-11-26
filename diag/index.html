@@ -147,7 +147,9 @@ async function checkEnv() {
       e.browser = (h.fullVersionList || []).map((b) => `${b.brand} ${b.version}`).join(', ');
     } catch { /* sin datos extra */ }
   }
+  e.isBrave = !!navigator.brave;
   kv('sec-env', 'Contexto seguro', e.secureContext, e.secureContext ? 'ok' : 'bad');
+  if (e.isBrave) kv('sec-env', 'Aviso', 'Brave detectado: bloquea/oculta WebGPU y parte de WebXR. Usa Chrome.', 'warn');
   kv('sec-env', 'Modelo', e.model);
   kv('sec-env', 'Plataforma', e.platform);
   kv('sec-env', 'Navegador', e.browser || e.userAgent);
@@ -177,7 +179,12 @@ async function checkWebGPU() {
   }
   g.adapter = !!gpuAdapter;
   kv('sec-webgpu', 'Adapter', gpuAdapter ? 'obtenido' : (g.adapterError || 'null'), gpuAdapter ? 'ok' : 'bad');
-  if (!gpuAdapter) return;
+  if (!gpuAdapter) {
+    kv('sec-webgpu', 'Pista', report.env.isBrave
+      ? 'Brave no entrega adapter WebGPU. Prueba en Chrome.'
+      : 'GPU en blocklist o WebGPU desactivado. Prueba chrome://flags/#enable-unsafe-webgpu.', 'warn');
+    return;
+  }
 
   let info = gpuAdapter.info;
   if (!info && gpuAdapter.requestAdapterInfo) {
@@ -337,11 +344,28 @@ async function checkWebXR() {
   x.XRWebGLBinding = typeof XRWebGLBinding !== 'undefined';
   x.getCameraImage = x.XRWebGLBinding && 'getCameraImage' in XRWebGLBinding.prototype;
   x.getDepthInfo = typeof XRFrame !== 'undefined' && 'getDepthInfo' in XRFrame.prototype;
+  // Qué métodos relacionados con profundidad expone realmente el navegador
+  const depthKeys = (cls) => {
+    const C = globalThis[cls];
+    if (!C?.prototype) return null;
+    const keys = [];
+    for (let p = C.prototype; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+      keys.push(...Object.getOwnPropertyNames(p).filter((k) => /depth/i.test(k)));
+    }
+    return keys;
+  };
+  x.depthApi = Object.fromEntries(
+    ['XRFrame', 'XRSession', 'XRWebGLBinding', 'XRView', 'XRCPUDepthInformation', 'XRWebGLDepthInformation']
+      .map((c) => [c, depthKeys(c)]),
+  );
   const ar = x.sessionSupport['immersive-ar'] === true;
   kv('sec-webxr', 'immersive-ar (ARCore)', x.sessionSupport['immersive-ar'], ar ? 'ok' : 'bad');
   kv('sec-webxr', 'immersive-vr', x.sessionSupport['immersive-vr']);
   kv('sec-webxr', 'API depth (XRFrame.getDepthInfo)', x.getDepthInfo, x.getDepthInfo ? 'ok' : 'warn');
   kv('sec-webxr', 'API camera (getCameraImage)', x.getCameraImage, x.getCameraImage ? 'ok' : 'warn');
+  for (const [cls, keys] of Object.entries(x.depthApi)) {
+    if (keys) kv('sec-webxr', `${cls} · depth*`, keys);
+  }
   $('#btn-ar').disabled = !ar;
 }
 
@@ -554,6 +578,7 @@ function showArResult() {
 function renderSummary() {
   clear('sec-summary');
   const g = report.webgpu, x = report.webxr, a = report.arSession, b = report.gpuBench;
+  if (report.env.isBrave) kv('sec-summary', 'Navegador', 'Brave: resultados no fiables, repite en Chrome', 'warn');
   const gpuOk = g.adapter && !g.isFallbackAdapter;
   kv('sec-summary', 'Compute (WebGPU)', gpuOk ? 'disponible' : 'no disponible', gpuOk ? 'ok' : 'bad');
   if (b && !b.error) {
