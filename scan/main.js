@@ -56,6 +56,8 @@ const state = window.vision = {
   continuing: false,     // sesión actual continúa un escaneo guardado
   aligning: false,
   align: null,           // último resultado de alineación
+  alignedAt: 0,
+  alignTrack: [],        // historial del seguimiento de la alineación (diagnóstico de deriva)
   volume: null,          // TSDF exportado al terminar
   walking: false,
   errors: [],
@@ -171,6 +173,15 @@ worker.onmessage = (ev) => {
       workerBusy = false;
       state.integrateMs = m.integrateMs;
       state.meshMs = m.meshMs;
+      if (m.track) {
+        // historial del seguimiento: si las correcciones crecen con el tiempo, ARCore deriva
+        state.alignTrack.push({
+          s: +((performance.now() - state.alignedAt) / 1000).toFixed(1), updated: m.track.updated,
+          dT_cm: +(m.track.dT * 100).toFixed(1), dYaw_deg: +(m.track.dYaw * 180 / Math.PI).toFixed(2),
+          ratio: +(m.track.inlierRatio ?? 0).toFixed(2), rms_cm: +((m.track.rms ?? 0) * 100).toFixed(1), ms: Math.round(m.track.ms),
+        });
+        if (m.track.updated) setWorldMatrix(new THREE.Matrix4().fromArray(m.track.matrix).invert().toArray());
+      }
       break;
     case 'aligning':
       workerBusy = false;
@@ -181,6 +192,8 @@ worker.onmessage = (ev) => {
       state.align = m;
       if (m.ok) {
         state.aligning = false;
+        state.alignedAt = performance.now();
+        state.alignTrack = [];
         // la malla guardada está en el marco guardado; para verla en la sesión: inversa
         setWorldMatrix(new THREE.Matrix4().fromArray(m.matrix).invert().toArray());
         world.visible = true;
@@ -650,7 +663,11 @@ setInterval(() => {
     const a = state.align;
     alignLine = state.aligning
       ? `alineando… ${a?.pending ? `${a.frames}/${a.needed} frames` : a ? `intento ${a.attempts}: ${Math.round((a.inlierRatio ?? 0) * 100)}% coincide${a.candidate ? ', confirmando' : ''}` : ''}`
-      : `alineado ✓ ${a ? `${Math.round(a.inlierRatio * 100)}% · ${(a.rms * 100).toFixed(1)} cm` : ''}`;
+      : `alineado ✓ ${a ? `${Math.round(a.inlierRatio * 100)}% · ${(a.rms * 100).toFixed(1)} cm` : ''}` +
+        (() => {
+          const upd = state.alignTrack.filter((x) => x.updated);
+          return upd.length ? `\nseguimiento: ${upd.length} ajustes, último Δ ${upd.at(-1).dT_cm} cm` : '';
+        })();
   }
   ui.hud.textContent = [
     `fps ${state.fps}   tracking ${state.tracking}${state.paused ? '   PAUSA' : ''}`,

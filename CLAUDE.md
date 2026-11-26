@@ -20,6 +20,11 @@ Sitio: https://fs-frost.github.io/vision/ (GitHub Pages desde `main`, raíz).
 - **Color:** la imagen de cámara se lee con `renderer.xr.getCameraTexture` y se dibuja en un render target con `renderer.xr.enabled = false` durante ese pase (si no, three usa la cámara XR). La fila 0 del buffer leído es la parte **inferior** de la vista (verificado en el g54). Los colores de vértice van en espacio lineal.
 - **Caché de Pages (10 min):** al probar un deploy recién hecho, recarga sin caché.
 - **Continuar escaneos:** la alineación (`Fusion.alignPoints`) es ICP punto-plano de 4 grados de libertad (yaw + traslación; la gravedad es común a ambas sesiones), con varias semillas de yaw y radios decrecientes. El worker solo la acepta si dos soluciones consecutivas coinciden. Nunca sobrescribas el escaneo original con una continuación: si la alineación falla, se pierde.
+- **Relocalización global** ("buscar en toda la habitación"): es la etapa previa al ICP que permite continuar desde cualquier punto de la habitación. Reglas decididas:
+  - Barrido guiado obligatorio (10–15 s).
+  - **Toda** alineación al continuar requiere confirmación visual del usuario («Coincide» / «Probar otra»), aunque no haya duda.
+  - La altura del suelo se calcula desde la malla, no se confía en `local-floor`.
+  - Los frames del barrido se integran tras confirmar, no se descartan.
 - **IndexedDB:** si cambias los stores, sube `DB_VERSION` en `scan/db.js` y crea los stores que falten en `onupgradeneeded`, sin borrar datos.
 - **No hay Python en esta máquina.** Para scripts usa Node o Bash.
 - **CSS:** cualquier página que use el atributo `hidden` en elementos con `display` propio necesita `[hidden] { display: none !important; }`.

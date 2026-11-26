@@ -339,3 +339,37 @@ test('alineación: refinar desde un candidato converge con una sola semilla', ()
   assert.ok(Math.abs(r.yaw + 0.1) < 0.015, `yaw ${r.yaw}`);
   assert.ok(Math.hypot(r.t[0] + 0.08, r.t[1], r.t[2] - 0.12) < 0.03, `t ${r.t}`);
 });
+
+test('seguimiento: corrige la deriva de la sesión después de alinear', () => {
+  const saved = new Fusion({ voxel: 0.04 });
+  scanRoom(saved);
+  const cont = new Fusion({ voxel: 0.04 });
+  cont.importVolume(saved.exportVolume());
+  const views = [[0.2, -0.35], [-0.4, -0.3], [0.6, -0.4], [-0.8, -0.25]];
+  const pointsFor = (A) => {
+    const Ainv = invertRigid(A), pts = [];
+    for (const [yaw, pitch] of views) {
+      const Mw = pose(yaw, pitch, 0, 1.3, 0);
+      pts.push(...cont.samplePoints(frameOf(roomDepth(Mw), mul4(Ainv, Mw))));
+    }
+    return Float32Array.from(pts);
+  };
+  // alineación inicial correcta
+  const A0 = yawMatrix(0.1, 0.05, 0.02, -0.1);
+  const r0 = cont.alignPoints(pointsFor(A0));
+  assert.ok(r0.ok);
+  cont.setAlign(r0.matrix, { yaw: r0.yaw, t: r0.t });
+  // ARCore deriva: la relación sesión -> mundo cambia 6 cm y 1.5°
+  const A1 = yawMatrix(0.1 + 0.026, 0.05 + 0.05, 0.02, -0.1 - 0.035);
+  const tr = cont.trackAlign(pointsFor(A1));
+  assert.ok(tr.updated, `no actualizó: ${JSON.stringify(tr)}`);
+  assert.ok(Math.abs(cont.alignParams.yaw - 0.126) < 0.012, `yaw ${cont.alignParams.yaw}`);
+  const t = cont.alignParams.t;
+  assert.ok(Math.hypot(t[0] - 0.1, t[1] - 0.02, t[2] + 0.135) < 0.025, `t ${t}`);
+  // puntos de una zona sin relación con la malla guardada: no debe moverse
+  const before = [...cont.alignParams.t];
+  const junk = new Float32Array(3000).map((_, i) => (i % 3 === 1 ? 5 : 8) + (i % 7) * 0.1);
+  const tj = cont.trackAlign(junk);
+  assert.equal(tj.updated, false);
+  assert.deepEqual(cont.alignParams.t, before);
+});

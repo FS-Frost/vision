@@ -412,7 +412,32 @@ export class Fusion {
 
   // ------------------------------------------------------------ alineación entre sesiones
 
-  setAlign(m) { this.align = m ? Float64Array.from(m) : null; }
+  /** Fija la alineación sesión -> mundo guardado. `params` = { yaw, t } (para seguir refinándola). */
+  setAlign(m, params = null) {
+    this.align = m ? Float64Array.from(m) : null;
+    this.alignParams = m ? params : null;
+  }
+
+  /**
+   * Seguimiento de la alineación: ARCore reajusta su mapa durante la sesión, así que una
+   * alineación calculada al principio deriva. Refina `align` con puntos recientes de la
+   * sesión contra la malla original (la nube objetivo cacheada al alinear por primera vez).
+   * Solo acepta pasos pequeños; si los puntos ven zona nueva (poca coincidencia), no cambia nada.
+   */
+  trackAlign(points, { maxStepT = 0.1, maxStepYaw = 0.05 } = {}) {
+    const p = this.alignParams;
+    if (!p) return { updated: false, reason: 'sin alineación' };
+    const r = this.alignPoints(points, {
+      yaws: [0], initial: [p.yaw, ...p.t], levels: [0.12, 0.08, 0.05], itersPer: 3, minRatio: 0.35, maxRms: 0.025,
+    });
+    const dT = Math.hypot(r.t[0] - p.t[0], r.t[1] - p.t[1], r.t[2] - p.t[2]);
+    const dYaw = r.yaw - p.yaw;
+    if (!r.ok || dT > maxStepT || Math.abs(dYaw) > maxStepYaw) {
+      return { updated: false, dT, dYaw, inlierRatio: r.inlierRatio, rms: r.rms };
+    }
+    this.setAlign(r.matrix, { yaw: r.yaw, t: r.t });
+    return { updated: true, matrix: r.matrix, yaw: r.yaw, t: r.t, dT, dYaw, inlierRatio: r.inlierRatio, rms: r.rms };
+  }
 
   /** Puntos 3D (en el marco de la sesión, sin `align`) de un mapa de profundidad, submuestreado. */
   samplePoints(f, stride = 4) {

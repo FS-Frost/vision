@@ -15,6 +15,12 @@ let lastMesh = 0;
 let alignFrames = [];
 let alignAttempts = 0;
 let candidate = null;         // última solución "ok" aún no confirmada
+// seguimiento de la alineación tras aceptarla (corrige la deriva de ARCore)
+const TRACK_SAMPLE_EVERY = 2; // frames integrados entre muestras de puntos
+const TRACK_EVERY = 8;        // frames integrados entre refinamientos (~1 s a 10 Hz)
+const TRACK_WINDOW = 4;       // muestras usadas en cada refinamiento
+let trackFrames = [];
+let trackCount = 0;
 
 const agrees = (a, b) => Math.abs(a.yaw - b.yaw) < AGREE_YAW && Math.hypot(a.t[0] - b.t[0], a.t[1] - b.t[1], a.t[2] - b.t[2]) < AGREE_T;
 
@@ -43,20 +49,38 @@ self.onmessage = (ev) => {
         alignFrames = [];
         alignAttempts = 0;
         candidate = null;
+        trackFrames = [];
+        trackCount = 0;
         if (m.volume) fusion.importVolume(m.volume);
         send('reset', { imported: !!m.volume });
         break;
 
       case 'integrate': {
+        const frame = frameFrom(m);
+        let track = null;
+        if (fusion.alignParams) {
+          trackCount++;
+          if (trackCount % TRACK_SAMPLE_EVERY === 0) {
+            trackFrames.push(fusion.samplePoints(frame, 4));
+            if (trackFrames.length > TRACK_WINDOW) trackFrames.shift();
+          }
+          if (trackCount % TRACK_EVERY === 0 && trackFrames.length >= 2) {
+            const ts = performance.now();
+            const pts = new Float32Array(trackFrames.reduce((s, a) => s + a.length, 0));
+            let o = 0;
+            for (const a of trackFrames) { pts.set(a, o); o += a.length; }
+            track = { ...fusion.trackAlign(pts), ms: performance.now() - ts };
+          }
+        }
         const t0 = performance.now();
-        const r = fusion.integrate(frameFrom(m));
+        const r = fusion.integrate(frame);
         const t1 = performance.now();
         let meshes = [];
         if (t1 - lastMesh > MESH_INTERVAL_MS) {
           meshes = fusion.extract(MESH_BUDGET_MS).meshes;
           lastMesh = performance.now();
         }
-        send('frame', { integrateMs: t1 - t0, meshMs: performance.now() - t1, used: r.used, updates: r.updates }, meshes);
+        send('frame', { integrateMs: t1 - t0, meshMs: performance.now() - t1, used: r.used, updates: r.updates, track }, meshes);
         break;
       }
 
@@ -86,7 +110,7 @@ self.onmessage = (ev) => {
         } else {
           candidate = null;
         }
-        if (ok) fusion.setAlign(r.matrix);
+        if (ok) fusion.setAlign(r.matrix, { yaw: r.yaw, t: r.t });
         self.postMessage({
           type: 'aligned', ok, candidate: r.ok && !ok, matrix: r.matrix, yaw: r.yaw, t: r.t,
           inlierRatio: r.inlierRatio, rms: r.rms, reason: r.reason, attempts: alignAttempts,
