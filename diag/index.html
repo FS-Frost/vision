@@ -70,6 +70,12 @@
     <p class="note">El benchmark integra una grilla de 128³ voxels (≈2M, 16 MB) con un compute shader parecido a la fusión TSDF real, 30 veces.</p>
   </section>
 
+  <section id="sec-cpu">
+    <h2>CPU (fallback) <button id="btn-cpu" class="secondary">Benchmark TSDF CPU</button></h2>
+    <dl></dl>
+    <p class="note">Fusión TSDF dispersa (bloques 8³, voxel 3 cm, truncamiento 10 cm) de un mapa de profundidad sintético 160×90, como el de ARCore, 30 frames.</p>
+  </section>
+
   <section id="sec-webgl"><h2>WebGL2</h2><dl></dl></section>
 
   <section id="sec-webxr">
@@ -103,7 +109,7 @@ const $ = (s) => document.querySelector(s);
 
 const report = {
   generatedAt: new Date().toISOString(),
-  env: {}, webgpu: {}, webgl: {}, webxr: {}, gpuBench: null, arSession: null,
+  env: {}, webgpu: {}, webgl: {}, webxr: {}, gpuBench: null, cpuBench: null, arSession: null,
 };
 
 // ---------- UI helpers ----------
@@ -182,7 +188,7 @@ async function checkWebGPU() {
   if (!gpuAdapter) {
     kv('sec-webgpu', 'Pista', report.env.isBrave
       ? 'Brave no entrega adapter WebGPU. Prueba en Chrome.'
-      : 'GPU en blocklist o WebGPU desactivado. Prueba chrome://flags/#enable-unsafe-webgpu.', 'warn');
+      : 'GPU en blocklist de Chrome (PowerVR lo está en Android). Prueba chrome://flags/#enable-unsafe-webgpu. Si no, el escáner usará CPU.', 'warn');
     return;
   }
 
@@ -310,6 +316,65 @@ async function runGpuBench() {
   updateJson();
 }
 
+// ---------- Benchmark CPU ----------
+function runCpuBench() {
+  const btn = $('#btn-cpu');
+  btn.disabled = true;
+  const W = 160, H = 90, fx = W * 0.9, fy = fx, cx = W / 2, cy = H / 2;
+  const voxel = 0.03, trunc = 0.1, iterations = 30, MAXW = 64;
+  const blocks = new Map(); // key numérico -> { t: Float32Array(512), w: Float32Array(512) }
+  const depth = new Float32Array(W * H);
+  for (let v = 0; v < H; v++) for (let u = 0; u < W; u++) {
+    depth[v * W + u] = 1.5 + 0.3 * Math.sin(u * 0.08) * Math.cos(v * 0.1);
+  }
+  let updates = 0;
+  const t0 = performance.now();
+  for (let k = 0; k < iterations; k++) {
+    const ox = 0.01 * k; // cámara se desplaza 1 cm/frame
+    for (let v = 0; v < H; v++) {
+      const dy = (v - cy) / fy;
+      for (let u = 0; u < W; u++) {
+        const d = depth[v * W + u];
+        const dx = (u - cx) / fx;
+        for (let s = -trunc; s <= trunc; s += voxel) {
+          const z = d + s;
+          const ix = Math.floor((ox + dx * z) / voxel);
+          const iy = Math.floor((dy * z) / voxel);
+          const iz = Math.floor(z / voxel);
+          const key = (((ix >> 3) + 512) * 1024 + ((iy >> 3) + 512)) * 1024 + ((iz >> 3) + 512);
+          let b = blocks.get(key);
+          if (!b) { b = { t: new Float32Array(512), w: new Float32Array(512) }; blocks.set(key, b); }
+          const li = (ix & 7) | ((iy & 7) << 3) | ((iz & 7) << 6);
+          const tsdf = -s / trunc;
+          const w0 = b.w[li], w1 = w0 + 1;
+          b.t[li] = (b.t[li] * w0 + tsdf) / w1;
+          b.w[li] = w1 < MAXW ? w1 : MAXW;
+          updates++;
+        }
+      }
+    }
+  }
+  const total = performance.now() - t0;
+  const res = report.cpuBench = {
+    iterations,
+    msPerFrame: +(total / iterations).toFixed(2),
+    voxelUpdatesPerFrame: Math.round(updates / iterations),
+    blocks: blocks.size,
+    memoryMB: +((blocks.size * 512 * 8) / 1e6).toFixed(1),
+    maxIntegrationHz: +(1000 / (total / iterations)).toFixed(1),
+  };
+  clear('sec-cpu');
+  const st = res.maxIntegrationHz >= 10 ? 'ok' : res.maxIntegrationHz >= 3 ? 'warn' : 'bad';
+  kv('sec-cpu', 'ms por frame', res.msPerFrame, st);
+  kv('sec-cpu', 'Hz máx. de fusión', res.maxIntegrationHz, st);
+  kv('sec-cpu', 'Voxels actualizados/frame', res.voxelUpdatesPerFrame);
+  kv('sec-cpu', 'Bloques / memoria', `${res.blocks} / ${res.memoryMB} MB`);
+  btn.textContent = 'Repetir benchmark CPU';
+  btn.disabled = false;
+  renderSummary();
+  updateJson();
+}
+
 // ---------- WebGL2 ----------
 function checkWebGL() {
   const w = report.webgl;
@@ -343,7 +408,10 @@ async function checkWebXR() {
   }
   x.XRWebGLBinding = typeof XRWebGLBinding !== 'undefined';
   x.getCameraImage = x.XRWebGLBinding && 'getCameraImage' in XRWebGLBinding.prototype;
-  x.getDepthInfo = typeof XRFrame !== 'undefined' && 'getDepthInfo' in XRFrame.prototype;
+  // Chrome renombró getDepthInfo -> getDepthInformation; aceptar ambos
+  x.cpuDepthMethod = typeof XRFrame === 'undefined' ? null
+    : 'getDepthInformation' in XRFrame.prototype ? 'getDepthInformation'
+    : 'getDepthInfo' in XRFrame.prototype ? 'getDepthInfo' : null;
   // Qué métodos relacionados con profundidad expone realmente el navegador
   const depthKeys = (cls) => {
     const C = globalThis[cls];
@@ -361,7 +429,7 @@ async function checkWebXR() {
   const ar = x.sessionSupport['immersive-ar'] === true;
   kv('sec-webxr', 'immersive-ar (ARCore)', x.sessionSupport['immersive-ar'], ar ? 'ok' : 'bad');
   kv('sec-webxr', 'immersive-vr', x.sessionSupport['immersive-vr']);
-  kv('sec-webxr', 'API depth (XRFrame.getDepthInfo)', x.getDepthInfo, x.getDepthInfo ? 'ok' : 'warn');
+  kv('sec-webxr', 'API depth CPU (XRFrame)', x.cpuDepthMethod ?? 'no', x.cpuDepthMethod ? 'ok' : 'warn');
   kv('sec-webxr', 'API camera (getCameraImage)', x.getCameraImage, x.getCameraImage ? 'ok' : 'warn');
   for (const [cls, keys] of Object.entries(x.depthApi)) {
     if (keys) kv('sec-webxr', `${cls} · depth*`, keys);
@@ -426,6 +494,7 @@ async function startAR() {
     enabledFeatures: session.enabledFeatures ? [...session.enabledFeatures] : null,
     depthUsage: safe(() => session.depthUsage),
     depthDataFormat: safe(() => session.depthDataFormat),
+    depthType: safe(() => session.depthType),
     domOverlayType: safe(() => session.domOverlayState?.type),
     durationS: 0, frames: 0, fps: null,
     trackedFrames: 0, emulatedFrames: 0, lostFrames: 0, pathMeters: 0,
@@ -494,7 +563,7 @@ async function startAR() {
       let di = null;
       try {
         if (s.depthUsage === 'gpu-optimized') di = binding?.getDepthInformation(view);
-        else if (s.depthUsage === 'cpu-optimized') di = frame.getDepthInfo(view);
+        else if (s.depthUsage === 'cpu-optimized') di = (frame.getDepthInformation ?? frame.getDepthInfo).call(frame, view);
       } catch (err) { s.depth.error = `${err.name}: ${err.message}`; }
       if (di) {
         s.depth.framesWithInfo++;
@@ -554,7 +623,7 @@ function showArResult() {
   } else {
     const has = (f) => s.enabledFeatures?.includes(f);
     kv('sec-ar', 'Features concedidas', s.enabledFeatures ?? 'n/d (enabledFeatures no soportado)');
-    kv('sec-ar', 'depth-sensing', s.depthUsage ? `${s.depthUsage} / ${s.depthDataFormat}` : 'no', s.depthUsage ? 'ok' : 'bad');
+    kv('sec-ar', 'depth-sensing', s.depthUsage ? `${s.depthUsage} / ${s.depthDataFormat} / ${s.depthType ?? '?'}` : 'no', s.depthUsage ? 'ok' : 'bad');
     kv('sec-ar', 'camera-access', has('camera-access') || s.camera.width ? 'sí' : 'no', s.camera.imageOk ? 'ok' : 'warn');
     kv('sec-ar', 'dom-overlay', s.domOverlayType ?? 'no', s.domOverlayType ? 'ok' : 'warn');
     kv('sec-ar', 'Duración (s)', s.durationS);
@@ -586,6 +655,10 @@ function renderSummary() {
   } else {
     kv('sec-summary', 'Fusión TSDF estimada', 'ejecuta el benchmark', 'info');
   }
+  const c = report.cpuBench;
+  const cpuOk = !!c && c.maxIntegrationHz >= 5;
+  kv('sec-summary', 'Fusión TSDF CPU', c ? `${c.maxIntegrationHz} Hz máx.` : 'ejecuta el benchmark CPU',
+    c ? (cpuOk ? 'ok' : 'warn') : 'info');
   const arOk = x.sessionSupport?.['immersive-ar'] === true;
   kv('sec-summary', 'Tracking 6DoF (ARCore)', arOk ? 'soportado' : 'no soportado', arOk ? 'ok' : 'bad');
   if (!a) {
@@ -597,10 +670,14 @@ function renderSummary() {
     kv('sec-summary', 'Color de cámara', a.camera.imageOk ? 'disponible' : 'no', a.camera.imageOk ? 'ok' : 'warn');
   }
   let verdict, st;
-  if (!gpuOk || !arOk) { verdict = 'Camino A (WebXR+ARCore+WebGPU) NO viable tal cual'; st = 'bad'; }
+  const depthOk = !!a && !a.error && !!a.depthUsage && a.depth.framesWithInfo > 0;
+  const computeOk = gpuOk || cpuOk;
+  if (!arOk) { verdict = 'Sin ARCore: camino A NO viable'; st = 'bad'; }
   else if (!a) { verdict = 'Prometedor: falta la prueba AR'; st = 'info'; }
-  else if (a.error || !a.depthUsage) { verdict = 'Tracking sí, profundidad no: requeriría depth monocular (camino B)'; st = 'warn'; }
-  else { verdict = 'Camino A viable'; st = 'ok'; }
+  else if (!depthOk) { verdict = 'Tracking sí, profundidad no: requeriría depth monocular (camino B)'; st = 'warn'; }
+  else if (!gpuOk && !c) { verdict = 'Tracking y profundidad OK; sin WebGPU: ejecuta benchmark CPU'; st = 'info'; }
+  else if (computeOk) { verdict = `Camino A viable (fusión en ${gpuOk ? 'WebGPU' : 'CPU'})`; st = 'ok'; }
+  else { verdict = 'Tracking y profundidad OK, pero la fusión es lenta'; st = 'warn'; }
   kv('sec-summary', 'Veredicto', verdict, st);
 }
 
@@ -624,6 +701,7 @@ if (navigator.share) {
 }
 
 $('#btn-bench').addEventListener('click', runGpuBench);
+$('#btn-cpu').addEventListener('click', runCpuBench);
 $('#btn-ar').addEventListener('click', startAR);
 
 // ---------- Inicio ----------
