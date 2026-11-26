@@ -2,62 +2,105 @@
 
 Web app estática que escanea una habitación con la cámara del teléfono y construye progresivamente una escena 3D navegable. Todo se ejecuta en el navegador: sin servidor ni build.
 
+**Sitio:** https://fs-frost.github.io/vision/
+
+- [Escáner](https://fs-frost.github.io/vision/scan/): recorre la habitación, mira la malla crecer sobre la cámara, orbita el resultado y exporta a `.glb`.
+- [Diagnóstico](https://fs-frost.github.io/vision/diag/): comprueba las capacidades del dispositivo (WebGPU, WebXR/ARCore, profundidad, cámara, benchmarks).
+
 ## Estado
 
-**Fase 0: diagnóstico.** [`diag/`](diag/) comprueba si un dispositivo soporta lo necesario. El escáner aún no existe.
+Prototipo funcional: escaneo en vivo, visor orbital y exportación `.glb`.
 
-## Arquitectura objetivo (camino A)
+Pendiente: color desde `camera-access`, navegación en primera persona, persistencia en IndexedDB y mejor cierre de huecos.
 
-1. **WebXR `immersive-ar` (ARCore)** entrega la pose 6DoF del teléfono en cada frame. No hace falta implementar SLAM.
-2. **`depth-sensing`** entrega un mapa de profundidad por frame (~160×90, estimado por ARCore).
-3. **`camera-access`** entrega el frame RGB para colorear la malla.
-4. **Fusión TSDF** en una grilla de voxels dispersa, en compute shaders WebGPU.
-5. **Marching cubes** incremental (WebGPU) sobre los bloques modificados produce la malla.
-6. Render y modo de navegación libre; exportación `.glb` y persistencia en IndexedDB.
+## Arquitectura
 
-Camino B (fallback sin ARCore): SLAM monocular en WASM + red de profundidad monocular. Es lento en gama media y queda descartado salvo que el camino A no sea viable.
+```
+WebXR immersive-ar (ARCore)
+  ├─ pose 6DoF por frame          (XRViewerPose, espacio 'local')
+  └─ profundidad CPU 160x90       (XRFrame.getDepthInformation, luminance-alpha)
+        │  ~10 Hz, ArrayBuffer transferido
+        ▼
+Web Worker (scan/fusion-worker.js → scan/fusion-core.js)
+  ├─ fusión TSDF dispersa         bloques 8³, voxel 4 cm, truncamiento 3 voxels
+  └─ Surface Nets por bloque      fusionado en superceldas 4³ (pocas draw calls)
+        │  geometrías por supercelda cada ~250 ms
+        ▼
+Hilo principal (scan/main.js, three.js 0.180)
+  ├─ malla semitransparente sobre la cámara durante el escaneo
+  └─ visor OrbitControls + GLTFExporter al terminar
+```
+
+### Decisiones
+
+- **Fusión en CPU, no en WebGPU.** El dispositivo de referencia (moto g54, GPU PowerVR BXM-8-256) no obtiene adapter WebGPU en Chrome Android porque PowerVR está en la blocklist. Con profundidad de 160×90, la fusión en CPU tarda ~5–25 ms por frame en un worker.
+- **three.js ≥ 0.175.** Las versiones anteriores llaman a `XRWebGLBinding.getDepthInformation` aunque la sesión use `cpu-optimized`, y eso rompe el bucle de render.
+- **`getDepthInformation`**. Chrome 158 renombró `getDepthInfo`; el código acepta ambos nombres.
+
+### Parámetros por URL (escáner)
+
+| Parámetro | Por defecto | Efecto |
+|---|---|---|
+| `voxel` | `0.04` | Tamaño de voxel en metros |
+| `hz` | `10` | Frecuencia máxima de integración de profundidad |
+
+Ejemplo: `scan/?voxel=0.03&hz=8`.
+
+## Resultados en el moto g54 (Chrome 158, Android 15)
+
+| Prueba | Resultado |
+|---|---|
+| Tracking 6DoF | OK, ~30 fps |
+| Profundidad | 160×90, `luminance-alpha`, 100 % de píxeles válidos, ~28 Hz |
+| Cámara | 864×1920 |
+| WebGPU | Sin adapter (blocklist PowerVR) |
+| Benchmark TSDF CPU | ~4 ms por 100k actualizaciones de voxel |
+| Escaneo real | 171 frames, 203 bloques, ~15k triángulos, 0,8 MB |
+
+Brave **no** sirve: oculta WebGPU y elimina la API de profundidad CPU.
 
 ## Requisitos
 
-- Android con **Chrome** reciente (121+ para WebGPU).
-- Dispositivo con **Google Play Services for AR** (ARCore).
-- **Contexto seguro**: HTTPS o `http://localhost`.
-- Dispositivo de referencia: Motorola g54 (Dimensity 7020, Mali-G57 MC2).
+- Android con **Chrome** reciente y *Google Play Services for AR*.
+- Contexto seguro: HTTPS (GitHub Pages) o `http://localhost`.
 
-## Ejecutar el diagnóstico en el teléfono
+## Desarrollo
 
-### Opción 1: USB + `adb reverse` (desarrollo local)
+### Deploy
+
+GitHub Pages sirve `main` desde la raíz (`.nojekyll` incluido). Cada push a `main` se publica en 1–2 minutos.
+
+### Tests
 
 ```bash
-# En el PC, en la raíz del repo
-npx serve -l 8080 .          # o: python -m http.server 8080
-
-# Teléfono conectado por USB con depuración USB activada
-adb reverse tcp:8080 tcp:8080
+node --test tests/*.test.mjs
 ```
 
-Abre `http://localhost:8080/diag/` en Chrome Android. `localhost` cuenta como contexto seguro. Para la consola remota usa `chrome://inspect` en el PC.
+Los tests cubren el núcleo de fusión: posición de la superficie, normales, orientación, costuras entre bloques, cámara rotada y rendimiento.
 
-### Opción 2: hosting estático HTTPS
+### Probar en el teléfono con depuración remota
 
-Sube el repo a GitHub Pages o Cloudflare Pages y abre `https://<host>/diag/`.
+```bash
+ADB=/c/android-sdk/platform-tools/adb.exe   # ruta en esta máquina
+"$ADB" devices                                # aceptar el diálogo de depuración USB en el teléfono
+"$ADB" shell "cat /proc/net/unix | grep devtools"   # socket de Chrome: chrome_devtools_remote_<pid>
+"$ADB" forward tcp:9223 localabstract:chrome_devtools_remote_<pid>
+curl http://127.0.0.1:9223/json/list         # pestañas abiertas
+"$ADB" exec-out screencap -p > screen.png     # captura (incluye la vista AR)
+```
 
-### Uso
+`chrome://inspect` en el PC también funciona. El escáner expone su estado en `window.vision`.
 
-1. La página detecta entorno, WebGPU, WebGL2 y WebXR automáticamente.
-2. **Benchmark TSDF** mide cuántas integraciones por segundo de una grilla 128³ soporta la GPU.
-3. **Probar sesión AR** abre una sesión de AR con profundidad y cámara. Muévete despacio 20–30 s y pulsa *Terminar*.
-4. **Copiar reporte JSON** copia los resultados para analizarlos.
-
-### Problemas comunes
-
-- `depth-sensing` o `camera-access` no concedidos: activa `chrome://flags/#webxr-incubations` y reinicia Chrome.
-- `immersive-ar` no soportado: instala o actualiza *Google Play Services for AR* desde Play Store.
-- Panel negro durante la sesión: `dom-overlay` no está concedido. Sal con el botón Atrás; los resultados se muestran igual.
+Si hay varios navegadores Chromium instalados (por ejemplo Brave), `chrome_devtools_remote` sin sufijo puede pertenecer a otro navegador. Comprueba el PID con `adb shell ps -A | grep com.android.chrome`.
 
 ## Estructura
 
 ```
-index.html        landing con enlaces
-diag/index.html   página de diagnóstico autocontenida (HTML + CSS + JS módulo inline)
+index.html              landing
+scan/index.html         escáner (UI + import map de three.js)
+scan/main.js            sesión XR, render, visor, exportación
+scan/fusion-worker.js   worker: mensajes integrate / flush / reset
+scan/fusion-core.js     TSDF disperso + Surface Nets (sin DOM, testeable en Node)
+diag/index.html         diagnóstico de capacidades (autocontenido)
+tests/                  tests de node:test
 ```
