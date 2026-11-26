@@ -1,7 +1,8 @@
 // Tests del núcleo de fusión. Ejecutar: node --test tests/*.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Fusion } from '../scan/fusion-core.js';
+import { Fusion, mul4, invertRigid, yawMatrix } from '../scan/fusion-core.js';
+import { Collider } from '../scan/collider.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -190,4 +191,132 @@ test('rendimiento: integración 160x90 y mallado', () => {
     console.log(`voxel ${voxel}: integrate ${tInt.toFixed(2)} ms/frame, malla final ${tMesh.toFixed(1)} ms, ${totalTris} tri, ${fusion.stats().memoryMB} MB`);
     assert.ok(totalTris > 0);
   }
+});
+
+// ---------------------------------------------------------------- escena sintética (habitación)
+
+// Pose cámara -> mundo: traslación * Ry(yaw) * Rx(pitch)
+function pose(yaw, pitch, x, y, z) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  return Float64Array.from([cy, 0, -sy, 0, sy * sp, cp, cy * sp, 0, sy * cp, -sp, cy * cp, 0, x, y, z, 1]);
+}
+
+// Habitación 3.5 x 4 m con una caja; profundidad plana por raycasting.
+const BOX = { min: [0.2, 0, -1.4], max: [0.7, 0.6, -0.9] };
+function roomDepth(M) {
+  const depth = new Uint16Array(W * H);
+  const o = [M[12], M[13], M[14]];
+  for (let j = 0; j < H; j++) {
+    for (let i = 0; i < W; i++) {
+      const xc = (2 * ((i + 0.5) / W) - 1) / PROJ[0];
+      const yc = (1 - 2 * ((j + 0.5) / H)) / PROJ[5];
+      const D = [0, 1, 2].map((r) => M[r] * xc + M[4 + r] * yc - M[8 + r]);
+      let t = Infinity;
+      const plane = (axis, v) => {
+        if (Math.abs(D[axis]) < 1e-9) return;
+        const tt = (v - o[axis]) / D[axis];
+        if (tt > 0.01 && tt < t) t = tt;
+      };
+      plane(1, 0); plane(1, 2.5); plane(0, -1.5); plane(0, 2); plane(2, -2.5); plane(2, 1.5);
+      // caja (slabs)
+      let t0 = 0.01, t1 = Infinity;
+      for (let a = 0; a < 3; a++) {
+        const inv = 1 / D[a];
+        let ta = (BOX.min[a] - o[a]) * inv, tb = (BOX.max[a] - o[a]) * inv;
+        if (ta > tb) [ta, tb] = [tb, ta];
+        t0 = Math.max(t0, ta); t1 = Math.min(t1, tb);
+      }
+      if (t0 <= t1 && t0 < t) t = t0;
+      depth[j * W + i] = Number.isFinite(t) && t < 60 ? Math.round(t * 1000) : 0;
+    }
+  }
+  return depth;
+}
+
+function frameOf(depth, viewMatrix) {
+  return { depth, width: W, height: H, rawToMeters: 0.001, normViewFromNormDepth: IDENT, projection: PROJ, viewMatrix };
+}
+
+function scanRoom(fusion) {
+  for (let yaw = -1.4; yaw <= 1.41; yaw += 0.2) {
+    for (const pitch of [-0.5, -0.15]) {
+      const M = pose(yaw, pitch, 0, 1.3, 0);
+      fusion.integrate(frameOf(roomDepth(M), M));
+      fusion.integrate(frameOf(roomDepth(M), M));
+    }
+  }
+}
+
+test('volumen: exportar e importar reproduce la malla', () => {
+  const a = new Fusion({ voxel: 0.04 });
+  scanRoom(a);
+  const ta = a.finalMeshes().totalTris;
+  const b = new Fusion({ voxel: 0.04 });
+  b.importVolume(a.exportVolume(), { maxWeight: 255 });
+  const tb = b.finalMeshes().totalTris;
+  assert.ok(ta > 1000);
+  assert.ok(Math.abs(ta - tb) / ta < 0.02, `triángulos ${ta} vs ${tb}`);
+});
+
+test('alineación: recupera yaw y traslación de una segunda sesión', () => {
+  const saved = new Fusion({ voxel: 0.04 });
+  scanRoom(saved);
+  const cont = new Fusion({ voxel: 0.04 });
+  cont.importVolume(saved.exportVolume());
+
+  // verdad: sesión -> mundo
+  const A = yawMatrix(0.25, 0.15, 0.03, -0.2);
+  const Ainv = invertRigid(A);
+  const pts = [];
+  for (const [yaw, pitch] of [[0.1, -0.35], [-0.3, -0.3], [0.5, -0.4], [-0.7, -0.2]]) {
+    const Mw = pose(yaw, pitch, 0.05, 1.3, 0.1);          // pose real en el mundo
+    const Ms = mul4(Ainv, Mw);                           // lo que reporta la nueva sesión
+    pts.push(...cont.samplePoints(frameOf(roomDepth(Mw), Ms)));
+  }
+  const t0 = performance.now();
+  const r = cont.alignPoints(Float32Array.from(pts));
+  console.log(`alineación ${(performance.now() - t0).toFixed(0)} ms`, { yaw: r.yaw, t: r.t, ratio: r.inlierRatio, rms: r.rms });
+  assert.ok(r.ok, `no alineó: ratio ${r.inlierRatio} rms ${r.rms}`);
+  assert.ok(Math.abs(r.yaw - 0.25) < 0.02, `yaw ${r.yaw}`);
+  assert.ok(Math.abs(r.t[0] - 0.15) < 0.03 && Math.abs(r.t[1] - 0.03) < 0.03 && Math.abs(r.t[2] + 0.2) < 0.03, `t ${r.t}`);
+
+  // integrar con la alineación no debe crear una pared "fantasma" desplazada
+  cont.setAlign(r.matrix);
+  const before = cont.finalMeshes().totalTris;
+  const Mw = pose(0, -0.3, 0.05, 1.3, 0.1);
+  for (let k = 0; k < 3; k++) cont.integrate(frameOf(roomDepth(Mw), mul4(Ainv, Mw)));
+  const after = cont.finalMeshes().totalTris;
+  assert.ok(after < before * 1.1, `la malla creció demasiado (${before} -> ${after}): integración desalineada`);
+});
+
+test('alineación: rechaza datos que no corresponden a la escena guardada', () => {
+  const saved = new Fusion({ voxel: 0.04 });
+  scanRoom(saved);
+  // nube aleatoria
+  const pts = new Float32Array(3000);
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  for (let i = 0; i < pts.length; i++) pts[i] = rnd() * 3 - 1.5 + (i % 3 === 1 ? 1.2 : 0);
+  const r = saved.alignPoints(pts);
+  assert.equal(r.ok, false);
+});
+
+test('colisiones: no se atraviesan paredes y se desliza contra ellas', () => {
+  const fusion = new Fusion({ voxel: 0.04 });
+  scanRoom(fusion);
+  const { meshes } = fusion.finalMeshes();
+  const col = new Collider(meshes, 0);
+  // la caja (0.2..0.7, -1.4..-0.9) llega a 0.6 m: obstáculo
+  assert.equal(col.blocked(0.45, -1.15), true, 'la caja debe bloquear');
+  assert.equal(col.blocked(0, 0), false, 'el centro debe estar libre');
+  // caminar hacia la pared z=-2.5 desde el centro: debe detenerse antes
+  let x = -0.6, z = 0;
+  for (let k = 0; k < 400; k++) [x, z] = col.move(x, z, 0, -0.01);
+  assert.ok(z > -2.5 + 0.1, `atravesó la pared: z=${z}`);
+  // deslizamiento: empujando en diagonal contra la pared, x sigue avanzando
+  const x0 = x;
+  for (let k = 0; k < 50; k++) [x, z] = col.move(x, z, 0.01, -0.01);
+  assert.ok(x > x0 + 0.3, 'debería deslizarse a lo largo de la pared');
+  const [fx, fz] = col.nearestFree(0.45, -1.15);
+  assert.equal(col.blocked(fx, fz), false);
 });

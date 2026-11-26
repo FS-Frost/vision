@@ -68,6 +68,57 @@ const W_NEIGHBORS = [1, -1, SW, -SW, SW * SW, -SW * SW];
 
 const now = () => (globalThis.performance ? performance.now() : Date.now());
 
+/** Producto de matrices 4x4 column-major: a * b */
+export function mul4(a, b) {
+  const o = new Float64Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+
+/** Inversa de una transformación rígida 4x4 column-major */
+export function invertRigid(m) {
+  const o = new Float64Array(16);
+  // R^T
+  o[0] = m[0]; o[1] = m[4]; o[2] = m[8];
+  o[4] = m[1]; o[5] = m[5]; o[6] = m[9];
+  o[8] = m[2]; o[9] = m[6]; o[10] = m[10];
+  // -R^T t
+  o[12] = -(o[0] * m[12] + o[4] * m[13] + o[8] * m[14]);
+  o[13] = -(o[1] * m[12] + o[5] * m[13] + o[9] * m[14]);
+  o[14] = -(o[2] * m[12] + o[6] * m[13] + o[10] * m[14]);
+  o[15] = 1;
+  return o;
+}
+
+/** Rotación alrededor de Y + traslación (column-major) */
+export function yawMatrix(yaw, tx = 0, ty = 0, tz = 0) {
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return Float64Array.from([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, tx, ty, tz, 1]);
+}
+
+const gridKey = (x, y, z) => ((x + 5000) * 10000 + (y + 5000)) * 10000 + (z + 5000);
+
+/** Resuelve A x = b (4x4) por eliminación gaussiana con pivoteo parcial. */
+function solve4(A, b) {
+  const M = [0, 1, 2, 3].map((r) => [A[r * 4], A[r * 4 + 1], A[r * 4 + 2], A[r * 4 + 3], b[r]]);
+  for (let c = 0; c < 4; c++) {
+    let p = c;
+    for (let r = c + 1; r < 4; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < 4; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k < 5; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return M.map((row, i) => row[4] / row[i]);
+}
+
 export class Fusion {
   constructor(opts = {}) {
     this.opts = { ...opts };
@@ -81,6 +132,8 @@ export class Fusion {
     this.stride = opts.stride ?? 1;
     this.edgeJump = opts.edgeJump ?? 0.08;       // salto relativo de profundidad que marca un borde
     this.colorTopDown = opts.colorTopDown ?? false; // fila 0 del buffer de color = arriba de la vista
+    this.align = null;           // matriz sesión -> mundo guardado (continuar escaneos)
+    this._target = null;         // nube objetivo para alineación (cache)
     this.blocks = new Map();     // key -> { key, t, w, c, cw, mask }
     this.touched = [];
     this.pending = new Set();
@@ -120,7 +173,8 @@ export class Fusion {
    */
   integrate(f) {
     const { depth, width, height, rawToMeters: k } = f;
-    const N = f.normViewFromNormDepth, P = f.projection, M = f.viewMatrix;
+    const N = f.normViewFromNormDepth, P = f.projection;
+    const M = this.align ? mul4(this.align, f.viewMatrix) : f.viewMatrix;
     const color = f.color || null, cwid = f.colorWidth | 0, chei = f.colorHeight | 0;
     const topDown = this.colorTopDown;
     const V = this.voxel, invV = 1 / V, trunc = this.trunc;
@@ -308,6 +362,220 @@ export class Fusion {
       if (m.indices.length) meshes.push(m);
     }
     return { meshes, removedTris: removed, totalTris: total };
+  }
+
+  // ------------------------------------------------------------ persistencia del volumen
+
+  /** Serializa el TSDF (compacto: tsdf Int16, peso Uint8) para guardarlo y continuar después. */
+  exportVolume() {
+    const n = this.blocks.size;
+    const keys = new Float64Array(n);
+    const t = new Int16Array(n * BLOCK3), w = new Uint8Array(n * BLOCK3);
+    const c = new Uint8Array(n * BLOCK3 * 3), cw = new Uint8Array(n * BLOCK3);
+    let i = 0;
+    for (const b of this.blocks.values()) {
+      keys[i] = b.key;
+      const o = i * BLOCK3;
+      for (let j = 0; j < BLOCK3; j++) {
+        t[o + j] = Math.round(b.t[j] * 32767);
+        w[o + j] = Math.min(255, Math.round(b.w[j]));
+      }
+      c.set(b.c, o * 3);
+      cw.set(b.cw, o);
+      i++;
+    }
+    return { version: 1, voxel: this.voxel, keys, t, w, c, cw };
+  }
+
+  /**
+   * Carga un volumen exportado. Los pesos se limitan para que las observaciones
+   * nuevas puedan corregir lo guardado.
+   */
+  importVolume(v, { maxWeight = 10 } = {}) {
+    if (Math.abs(v.voxel - this.voxel) > 1e-6) throw new Error(`voxel distinto: ${v.voxel} != ${this.voxel}`);
+    for (let i = 0; i < v.keys.length; i++) {
+      const o = i * BLOCK3;
+      const b = {
+        key: v.keys[i], mask: 1 << 13,
+        t: new Float32Array(BLOCK3), w: new Float32Array(BLOCK3),
+        c: v.c.slice(o * 3, (o + BLOCK3) * 3), cw: v.cw.slice(o, o + BLOCK3),
+      };
+      for (let j = 0; j < BLOCK3; j++) {
+        b.t[j] = v.t[o + j] / 32767;
+        b.w[j] = Math.min(maxWeight, v.w[o + j]);
+      }
+      this.blocks.set(b.key, b);
+      this.touched.push(b);
+    }
+    this._target = null;
+  }
+
+  // ------------------------------------------------------------ alineación entre sesiones
+
+  setAlign(m) { this.align = m ? Float64Array.from(m) : null; }
+
+  /** Puntos 3D (en el marco de la sesión, sin `align`) de un mapa de profundidad, submuestreado. */
+  samplePoints(f, stride = 4) {
+    const { depth, width, height, rawToMeters: k } = f;
+    const N = f.normViewFromNormDepth, P = f.projection, M = f.viewMatrix;
+    const P0 = P[0], P5 = P[5], P8 = P[8], P9 = P[9];
+    const out = [];
+    for (let j = 0; j < height; j += stride) {
+      for (let i = 0; i < width; i += stride) {
+        const id = j * width + i;
+        const d = depth[id] * k;
+        if (!(d >= this.minDepth && d <= Math.min(this.maxDepth, 3.5))) continue;
+        if (i + 1 < width && Math.abs(depth[id + 1] * k - d) > this.edgeJump * d) continue;
+        if (j + 1 < height && Math.abs(depth[id + width] * k - d) > this.edgeJump * d) continue;
+        const ud = (i + 0.5) / width, vd = (j + 0.5) / height;
+        const u = N[0] * ud + N[4] * vd + N[12];
+        const v = N[1] * ud + N[5] * vd + N[13];
+        const xc = (d * (2 * u - 1 + P8)) / P0, yc = (d * (1 - 2 * v + P9)) / P5, zc = -d;
+        out.push(
+          M[0] * xc + M[4] * yc + M[8] * zc + M[12],
+          M[1] * xc + M[5] * yc + M[9] * zc + M[13],
+          M[2] * xc + M[6] * yc + M[10] * zc + M[14],
+        );
+      }
+    }
+    return Float32Array.from(out);
+  }
+
+  /** Nube objetivo: vértices de la malla actual submuestreados a celdas de 5 cm. */
+  _targetCloud() {
+    if (this._target) return this._target;
+    while (this.touched.length || this.pending.size) this.extract(Infinity);
+    const G = 0.05, acc = new Map();
+    for (const m of this.blockMeshes.values()) {
+      const p = m.positions, n = m.normals;
+      for (let i = 0; i < p.length; i += 3) {
+        const key = gridKey(Math.floor(p[i] / G), Math.floor(p[i + 1] / G), Math.floor(p[i + 2] / G));
+        let a = acc.get(key);
+        if (!a) { a = [0, 0, 0, 0, 0, 0, 0]; acc.set(key, a); }
+        a[0] += p[i]; a[1] += p[i + 1]; a[2] += p[i + 2];
+        a[3] += n[i]; a[4] += n[i + 1]; a[5] += n[i + 2]; a[6]++;
+      }
+    }
+    const pos = new Float32Array(acc.size * 3), nor = new Float32Array(acc.size * 3);
+    let k = 0;
+    for (const a of acc.values()) {
+      const len = Math.hypot(a[3], a[4], a[5]);
+      if (len < 0.5 * a[6]) continue; // normales inconsistentes (esquinas finas)
+      pos[k * 3] = a[0] / a[6]; pos[k * 3 + 1] = a[1] / a[6]; pos[k * 3 + 2] = a[2] / a[6];
+      nor[k * 3] = a[3] / len; nor[k * 3 + 1] = a[4] / len; nor[k * 3 + 2] = a[5] / len;
+      k++;
+    }
+    this._target = { pos: pos.subarray(0, k * 3), nor: nor.subarray(0, k * 3), n: k };
+    return this._target;
+  }
+
+  /**
+   * Alinea puntos de la sesión actual con la malla guardada. Estima yaw + traslación
+   * (los dos marcos tienen la gravedad en +Y) con ICP punto-plano desde varias
+   * semillas de yaw y radios de búsqueda decrecientes.
+   * @returns {{ok, matrix, yaw, t, inlierRatio, rms}}
+   */
+  alignPoints(src, opts = {}) {
+    const yaws = opts.yaws ?? [0, 0.35, -0.35, 0.7, -0.7];
+    const levels = opts.levels ?? [0.5, 0.3, 0.2, 0.12, 0.08, 0.05];
+    const itersPer = opts.itersPer ?? 4;
+    const T = this._targetCloud();
+    if (T.n < 200) return { ok: false, reason: 'poca geometría guardada', inlierRatio: 0, rms: Infinity };
+    const nSrc = src.length / 3;
+    if (nSrc < 100) return { ok: false, reason: 'pocos puntos de la sesión', inlierRatio: 0, rms: Infinity };
+
+    const grids = levels.map((G) => {
+      const cells = new Map();
+      for (let i = 0; i < T.n; i++) {
+        const key = gridKey(Math.floor(T.pos[i * 3] / G), Math.floor(T.pos[i * 3 + 1] / G), Math.floor(T.pos[i * 3 + 2] / G));
+        let l = cells.get(key);
+        if (!l) { l = []; cells.set(key, l); }
+        l.push(i);
+      }
+      return { G, cells };
+    });
+    const nearest = (grid, x, y, z) => {
+      const G = grid.G, cx = Math.floor(x / G), cy = Math.floor(y / G), cz = Math.floor(z / G);
+      let best = -1, bd = G * G;
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+        const l = grid.cells.get(gridKey(cx + dx, cy + dy, cz + dz));
+        if (!l) continue;
+        for (const i of l) {
+          const ex = T.pos[i * 3] - x, ey = T.pos[i * 3 + 1] - y, ez = T.pos[i * 3 + 2] - z;
+          const d2 = ex * ex + ey * ey + ez * ez;
+          if (d2 < bd) { bd = d2; best = i; }
+        }
+      }
+      return best;
+    };
+    const pick = (max) => {
+      const step = Math.max(1, Math.floor(nSrc / max));
+      const out = [];
+      for (let i = 0; i < nSrc; i += step) out.push(i);
+      return out;
+    };
+    const coarse = pick(400), fine = pick(1200);
+
+    const step = (p, set, grid) => {
+      const H = new Float64Array(16), b = new Float64Array(4);
+      const c = Math.cos(p[0]), s = Math.sin(p[0]);
+      let n = 0;
+      for (const i of set) {
+        const px = src[i * 3], py = src[i * 3 + 1], pz = src[i * 3 + 2];
+        const qx = c * px + s * pz + p[1], qy = py + p[2], qz = -s * px + c * pz + p[3];
+        const j = nearest(grid, qx, qy, qz);
+        if (j < 0) continue;
+        const nx = T.nor[j * 3], ny = T.nor[j * 3 + 1], nz = T.nor[j * 3 + 2];
+        const r = nx * (qx - T.pos[j * 3]) + ny * (qy - T.pos[j * 3 + 1]) + nz * (qz - T.pos[j * 3 + 2]);
+        const w = Math.abs(r) < 0.02 ? 1 : 0.02 / Math.abs(r);
+        const J = [nx * (-s * px + c * pz) + nz * (-c * px - s * pz), nx, ny, nz];
+        for (let a = 0; a < 4; a++) {
+          b[a] += w * J[a] * r;
+          for (let k = 0; k < 4; k++) H[a * 4 + k] += w * J[a] * J[k];
+        }
+        n++;
+      }
+      if (n < 30) return;
+      for (let a = 0; a < 4; a++) H[a * 4 + a] += 1e-3 + H[a * 4 + a] * 1e-2; // amortiguación
+      const d = solve4(H, b.map((v) => -v));
+      if (!d) return;
+      p[0] += Math.max(-0.2, Math.min(0.2, d[0]));
+      for (let a = 1; a < 4; a++) p[a] += Math.max(-0.25, Math.min(0.25, d[a]));
+    };
+
+    const score = (p, set, grid) => {
+      const c = Math.cos(p[0]), s = Math.sin(p[0]);
+      let inl = 0, se = 0;
+      for (const i of set) {
+        const px = src[i * 3], py = src[i * 3 + 1], pz = src[i * 3 + 2];
+        const qx = c * px + s * pz + p[1], qy = py + p[2], qz = -s * px + c * pz + p[3];
+        const j = nearest(grid, qx, qy, qz);
+        if (j < 0) continue;
+        const r = T.nor[j * 3] * (qx - T.pos[j * 3]) + T.nor[j * 3 + 1] * (qy - T.pos[j * 3 + 1]) + T.nor[j * 3 + 2] * (qz - T.pos[j * 3 + 2]);
+        inl++; se += r * r;
+      }
+      return { ratio: inl / set.length, rms: inl ? Math.sqrt(se / inl) : Infinity };
+    };
+
+    let best = null;
+    const init = opts.initial ?? [0, 0, 0, 0];
+    for (const dy of yaws) {
+      const p = [init[0] + dy, init[1], init[2], init[3]];
+      levels.forEach((_, li) => {
+        const set = levels[li] >= 0.2 ? coarse : fine;
+        for (let it = 0; it < itersPer; it++) step(p, set, grids[li]);
+      });
+      const sc = score(p, fine, grids[grids.length - 1]);
+      if (!best || sc.ratio > best.ratio + 0.02 || (Math.abs(sc.ratio - best.ratio) <= 0.02 && sc.rms < best.rms)) {
+        best = { ...sc, p };
+      }
+    }
+    const [yaw, tx, ty, tz] = best.p;
+    return {
+      ok: best.ratio >= (opts.minRatio ?? 0.5) && best.rms <= (opts.maxRms ?? 0.025),
+      matrix: Array.from(yawMatrix(yaw, tx, ty, tz)),
+      yaw, t: [tx, ty, tz], inlierRatio: best.ratio, rms: best.rms,
+    };
   }
 
   stats() {

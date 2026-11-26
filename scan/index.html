@@ -57,7 +57,7 @@
     border-radius: 50%; border: 2px solid rgba(255,255,255,.35); background: rgba(255,255,255,.08); pointer-events: none; }
   #joy-knob { position: absolute; left: 50%; top: 50%; width: 48px; height: 48px; border-radius: 50%;
     background: rgba(255,255,255,.45); transform: translate(-50%, -50%); }
-  #btn-walk-exit { position: fixed; z-index: 2; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); }
+  #walk-bar { position: fixed; z-index: 2; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); justify-content: flex-end; }
   #walk-hint { position: fixed; z-index: 1; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
     background: rgba(0,0,0,.55); border-radius: 999px; padding: 6px 14px; font-size: 12px; color: #fff; pointer-events: none; white-space: nowrap; }
 </style>
@@ -74,7 +74,10 @@
 <div id="stage"></div>
 <div id="joy" hidden><div id="joy-knob"></div></div>
 <div id="walk-hint" hidden>Izquierda: moverse · Derecha: mirar</div>
-<button id="btn-walk-exit" class="secondary" hidden>Salir del paseo</button>
+<div id="walk-bar" class="row" hidden>
+  <button id="btn-collide" class="secondary">Colisiones: sí</button>
+  <button id="btn-walk-exit" class="secondary">Salir del paseo</button>
+</div>
 
 <section class="sheet" id="sheet">
   <!-- Inicio -->
@@ -87,6 +90,8 @@
         <option value="0.03">Alta · 3 cm</option>
         <option value="0.04">Normal · 4 cm</option>
       </select>
+      <button id="btn-import" class="secondary">Abrir archivo</button>
+      <input type="file" id="file-input" accept=".glb,.html,model/gltf-binary,text/html" hidden>
     </div>
     <div id="saved" hidden>
       <h2>Escaneos guardados</h2>
@@ -101,6 +106,8 @@
     <div class="row">
       <button id="btn-walk" class="secondary">Caminar</button>
       <button id="btn-shade" class="secondary">Sombreado</button>
+      <button id="btn-continue" class="secondary">Continuar escaneo</button>
+      <button id="btn-share" class="secondary">Compartir</button>
       <button id="btn-export" class="secondary">Exportar .glb</button>
       <button id="btn-home" class="secondary">Mis escaneos</button>
       <button id="btn-new">Nuevo escaneo</button>

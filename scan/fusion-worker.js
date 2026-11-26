@@ -1,16 +1,30 @@
 // Web Worker: recibe mapas de profundidad (+ color) y poses, fusiona y devuelve mallas por supercelda.
+// También guarda/carga el volumen TSDF y alinea una sesión nueva con un escaneo guardado.
 import { Fusion } from './fusion-core.js';
 
 const MESH_INTERVAL_MS = 250;
 const MESH_BUDGET_MS = 30;
+const ALIGN_MIN_FRAMES = 5;   // frames acumulados antes de intentar alinear
+const ALIGN_WINDOW = 10;      // ventana deslizante de frames para alinear
 
 let fusion = new Fusion();
 let lastMesh = 0;
+let alignFrames = [];
+let alignAttempts = 0;
 
 function send(type, extra, meshes = []) {
   const transfer = [];
   for (const m of meshes) transfer.push(m.positions.buffer, m.normals.buffer, m.colors.buffer, m.indices.buffer);
   self.postMessage({ type, meshes, stats: fusion.stats(), ...extra }, transfer);
+}
+
+function frameFrom(m) {
+  return {
+    depth: m.format === 'float32' ? new Float32Array(m.buffer) : new Uint16Array(m.buffer),
+    width: m.width, height: m.height, rawToMeters: m.rawToMeters,
+    normViewFromNormDepth: m.normViewFromNormDepth, projection: m.projection, viewMatrix: m.viewMatrix,
+    color: m.color ? new Uint8Array(m.color) : null, colorWidth: m.colorWidth, colorHeight: m.colorHeight,
+  };
 }
 
 self.onmessage = (ev) => {
@@ -20,17 +34,15 @@ self.onmessage = (ev) => {
       case 'reset':
         fusion = new Fusion(m.options ?? fusion.opts);
         lastMesh = 0;
-        send('reset', {});
+        alignFrames = [];
+        alignAttempts = 0;
+        if (m.volume) fusion.importVolume(m.volume);
+        send('reset', { imported: !!m.volume });
         break;
 
       case 'integrate': {
         const t0 = performance.now();
-        const depth = m.format === 'float32' ? new Float32Array(m.buffer) : new Uint16Array(m.buffer);
-        const r = fusion.integrate({
-          depth, width: m.width, height: m.height, rawToMeters: m.rawToMeters,
-          normViewFromNormDepth: m.normViewFromNormDepth, projection: m.projection, viewMatrix: m.viewMatrix,
-          color: m.color ? new Uint8Array(m.color) : null, colorWidth: m.colorWidth, colorHeight: m.colorHeight,
-        });
+        const r = fusion.integrate(frameFrom(m));
         const t1 = performance.now();
         let meshes = [];
         if (t1 - lastMesh > MESH_INTERVAL_MS) {
@@ -41,11 +53,36 @@ self.onmessage = (ev) => {
         break;
       }
 
+      case 'align-frame': {
+        // acumula puntos de la sesión nueva; cuando hay suficientes, intenta alinear
+        alignFrames.push(fusion.samplePoints(frameFrom(m), 4));
+        if (alignFrames.length > ALIGN_WINDOW) alignFrames.shift();
+        if (alignFrames.length < ALIGN_MIN_FRAMES) {
+          self.postMessage({ type: 'aligning', frames: alignFrames.length, needed: ALIGN_MIN_FRAMES });
+          break;
+        }
+        const total = alignFrames.reduce((s, a) => s + a.length, 0);
+        const pts = new Float32Array(total);
+        let o = 0;
+        for (const a of alignFrames) { pts.set(a, o); o += a.length; }
+        const t0 = performance.now();
+        const r = fusion.alignPoints(pts);
+        alignAttempts++;
+        if (r.ok) fusion.setAlign(r.matrix);
+        self.postMessage({
+          type: 'aligned', ok: r.ok, matrix: r.matrix, yaw: r.yaw, t: r.t,
+          inlierRatio: r.inlierRatio, rms: r.rms, reason: r.reason, attempts: alignAttempts,
+          ms: performance.now() - t0,
+        });
+        break;
+      }
+
       case 'flush': {
         // malla final completa y limpia (al cerrar la sesión); reemplaza todo
         const t0 = performance.now();
         const r = fusion.finalMeshes();
-        send('flushed', { meshMs: performance.now() - t0, removedTris: r.removedTris, replaceAll: true }, r.meshes);
+        const volume = fusion.exportVolume();
+        send('flushed', { meshMs: performance.now() - t0, removedTris: r.removedTris, replaceAll: true, volume }, r.meshes);
         break;
       }
     }

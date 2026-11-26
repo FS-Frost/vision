@@ -1,8 +1,9 @@
 // Persistencia de escaneos en IndexedDB.
-// Dos stores: "meta" (ligero, para listar) y "data" (geometría por supercelda).
+// Stores: "meta" (ligero, para listar), "data" (geometría por supercelda) y
+// "volume" (TSDF compacto, necesario para continuar un escaneo).
 
 const DB_NAME = 'vision';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let dbPromise = null;
 
 function open() {
@@ -11,8 +12,9 @@ function open() {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
-        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'id' });
-        if (!db.objectStoreNames.contains('data')) db.createObjectStore('data', { keyPath: 'id' });
+        for (const name of ['meta', 'data', 'volume']) {
+          if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: 'id' });
+        }
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -36,22 +38,33 @@ function request(req) {
   });
 }
 
-/**
- * @param {{ name: string, voxel: number, hasColor: boolean, chunks: Array<{key, positions, normals, colors, indices}> }} scan
- * @returns {Promise<string>} id
- */
-export async function saveScan({ name, voxel, hasColor, chunks }) {
-  const db = await open();
-  const id = crypto.randomUUID();
+function summarize(chunks) {
   let triangles = 0, bytes = 0;
   for (const c of chunks) {
     triangles += c.indices.length / 3;
     bytes += c.positions.byteLength + c.normals.byteLength + c.colors.byteLength + c.indices.byteLength;
   }
-  const meta = { id, name, voxel, hasColor: !!hasColor, triangles, bytes, createdAt: Date.now() };
-  const tx = db.transaction(['meta', 'data'], 'readwrite');
+  return { triangles, bytes };
+}
+
+/**
+ * Crea o sobrescribe un escaneo.
+ * @param {{ id?: string, name: string, voxel?: number, hasColor: boolean,
+ *           chunks: Array<{key, positions, normals, colors, indices}>, volume?: object, createdAt?: number }} scan
+ * @returns {Promise<string>} id
+ */
+export async function saveScan({ id, name, voxel, hasColor, chunks, volume, createdAt }) {
+  const db = await open();
+  id = id ?? crypto.randomUUID();
+  const meta = {
+    id, name, voxel: voxel ?? null, hasColor: !!hasColor, hasVolume: !!volume,
+    ...summarize(chunks), createdAt: createdAt ?? Date.now(), updatedAt: Date.now(),
+  };
+  const tx = db.transaction(['meta', 'data', 'volume'], 'readwrite');
   tx.objectStore('meta').put(meta);
   tx.objectStore('data').put({ id, chunks });
+  if (volume) tx.objectStore('volume').put({ id, volume });
+  else tx.objectStore('volume').delete(id);
   await done(tx);
   return id;
 }
@@ -59,7 +72,7 @@ export async function saveScan({ name, voxel, hasColor, chunks }) {
 export async function listScans() {
   const db = await open();
   const all = await request(db.transaction('meta').objectStore('meta').getAll());
-  return all.sort((a, b) => b.createdAt - a.createdAt);
+  return all.sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt));
 }
 
 export async function loadScan(id) {
@@ -72,19 +85,15 @@ export async function loadScan(id) {
   return meta && data ? { ...meta, chunks: data.chunks } : null;
 }
 
-export async function deleteScan(id) {
+export async function loadVolume(id) {
   const db = await open();
-  const tx = db.transaction(['meta', 'data'], 'readwrite');
-  tx.objectStore('meta').delete(id);
-  tx.objectStore('data').delete(id);
-  await done(tx);
+  const rec = await request(db.transaction('volume').objectStore('volume').get(id));
+  return rec?.volume ?? null;
 }
 
-export async function renameScan(id, name) {
+export async function deleteScan(id) {
   const db = await open();
-  const tx = db.transaction('meta', 'readwrite');
-  const store = tx.objectStore('meta');
-  const meta = await request(store.get(id));
-  if (meta) store.put({ ...meta, name });
+  const tx = db.transaction(['meta', 'data', 'volume'], 'readwrite');
+  for (const s of ['meta', 'data', 'volume']) tx.objectStore(s).delete(id);
   await done(tx);
 }

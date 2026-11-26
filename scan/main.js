@@ -1,13 +1,17 @@
 // Escáner: sesión WebXR (ARCore) -> profundidad + color + pose -> worker de fusión -> malla en three.js.
-// Al terminar: visor (orbitar / caminar), exportación .glb y guardado en IndexedDB.
+// Al terminar: visor (orbitar / caminar con colisiones), guardado en IndexedDB, continuar un
+// escaneo guardado (alineando la sesión nueva), compartir como .html y exportar .glb.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { WalkControls } from './walk.js';
+import { Collider } from './collider.js';
+import { buildViewerHtml, shareOrDownload, importFile } from './share.js';
 import * as db from './db.js';
 
 const params = new URLSearchParams(location.search);
 const SEND_INTERVAL_MS = 1000 / (parseFloat(params.get('hz')) || 10);
+const ALIGN_INTERVAL_MS = 250;
 const COLOR_TOP_DOWN = params.get('colorTopDown') === '1';
 const COLOR_WIDTH = 120;   // ancho de la imagen de color leída de la GPU
 const EYE_HEIGHT = 1.5;    // m sobre el suelo en modo paseo (máximo)
@@ -16,11 +20,14 @@ const $ = (s) => document.querySelector(s);
 const ui = {
   sheet: $('#sheet'),
   home: $('#home'), homeText: $('#home-text'), scan: $('#btn-scan'), quality: $('#quality'),
+  importBtn: $('#btn-import'), fileInput: $('#file-input'),
   saved: $('#saved'), savedList: $('#saved-list'),
   viewer: $('#viewer'), viewerTitle: $('#viewer-title'), viewerText: $('#viewer-text'), viewerStats: $('#viewer-stats'),
-  walk: $('#btn-walk'), shade: $('#btn-shade'), exportBtn: $('#btn-export'), homeBtn: $('#btn-home'), newBtn: $('#btn-new'),
+  walk: $('#btn-walk'), shade: $('#btn-shade'), cont: $('#btn-continue'), share: $('#btn-share'),
+  exportBtn: $('#btn-export'), homeBtn: $('#btn-home'), newBtn: $('#btn-new'),
   overlay: $('#overlay'), hud: $('#hud'), hint: $('#hint'), pause: $('#btn-pause'), stop: $('#btn-stop'),
-  joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'), walkExit: $('#btn-walk-exit'),
+  joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
+  walkBar: $('#walk-bar'), walkExit: $('#btn-walk-exit'), collide: $('#btn-collide'),
 };
 if (params.get('voxel')) {
   const opt = new Option(`${parseFloat(params.get('voxel')) * 100} cm (URL)`, params.get('voxel'));
@@ -45,7 +52,11 @@ const state = window.vision = {
   fusion: null,
   chunks: 0,
   hasColor: false,
-  currentId: null,
+  meta: null,            // escaneo mostrado: { id, name, createdAt, voxel, hasVolume }
+  continuing: false,     // sesión actual continúa un escaneo guardado
+  aligning: false,
+  align: null,           // último resultado de alineación
+  volume: null,          // TSDF exportado al terminar
   walking: false,
   errors: [],
 };
@@ -85,10 +96,18 @@ const materials = {
 };
 let currentMaterial = materials.ar;
 
+// `world` contiene la malla en el marco del escaneo guardado. Al continuar un escaneo,
+// su matriz es la inversa de la alineación (marco guardado -> marco de la sesión AR).
 const world = new THREE.Group();
 world.name = 'scan';
+world.matrixAutoUpdate = false;
 scene.add(world);
 let grid = null;
+
+function setWorldMatrix(arr) {
+  if (arr) world.matrix.fromArray(arr); else world.matrix.identity();
+  world.matrixWorldNeedsUpdate = true;
+}
 
 const chunks = new Map(); // clave de supercelda -> { mesh, data }
 
@@ -147,15 +166,33 @@ worker.onmessage = (ev) => {
   if (m.type === 'error') { workerBusy = false; logError('worker', { name: '', message: m.message }); return; }
   if (m.meshes?.length || m.replaceAll) applyMeshes(m.meshes ?? [], !!m.replaceAll);
   if (m.stats) state.fusion = m.stats;
-  if (m.type === 'frame') {
-    workerBusy = false;
-    state.integrateMs = m.integrateMs;
-    state.meshMs = m.meshMs;
-  } else if (m.type === 'flushed') {
-    state.meshMs = m.meshMs;
-    state.removedTris = m.removedTris;
-    flushResolve?.();
-    flushResolve = null;
+  switch (m.type) {
+    case 'frame':
+      workerBusy = false;
+      state.integrateMs = m.integrateMs;
+      state.meshMs = m.meshMs;
+      break;
+    case 'aligning':
+      workerBusy = false;
+      state.align = { pending: true, frames: m.frames, needed: m.needed };
+      break;
+    case 'aligned':
+      workerBusy = false;
+      state.align = m;
+      if (m.ok) {
+        state.aligning = false;
+        // la malla guardada está en el marco guardado; para verla en la sesión: inversa
+        setWorldMatrix(new THREE.Matrix4().fromArray(m.matrix).invert().toArray());
+        world.visible = true;
+      }
+      break;
+    case 'flushed':
+      state.meshMs = m.meshMs;
+      state.removedTris = m.removedTris;
+      state.volume = m.volume;
+      flushResolve?.();
+      flushResolve = null;
+      break;
   }
 };
 worker.onerror = (e) => { workerBusy = false; logError('worker', e); };
@@ -195,7 +232,8 @@ function grabCameraColor(view) {
 
 // ---------------------------------------------------------------- sesión AR
 
-async function startScan() {
+/** @param {{ id, name, createdAt } | null} continueFrom escaneo guardado a continuar */
+async function startScan(continueFrom = null) {
   // requestSession debe llamarse sin awaits previos (gesto de usuario)
   let session;
   try {
@@ -210,11 +248,27 @@ async function startScan() {
     showHome(`No se pudo iniciar AR: ${err.message}`);
     return;
   }
-  const voxel = parseFloat(ui.quality.value) || 0.03;
-  worker.postMessage({ type: 'reset', options: { voxel, colorTopDown: COLOR_TOP_DOWN } });
-  clearWorld();
+
+  let volume = null;
+  if (continueFrom) {
+    volume = await db.loadVolume(continueFrom.id).catch((err) => { logError('db', err); return null; });
+    if (!volume) {
+      session.end();
+      ui.viewerText.textContent = 'Este escaneo no tiene volumen guardado: no se puede continuar.';
+      return;
+    }
+  }
+  const voxel = volume?.voxel ?? (parseFloat(ui.quality.value) || 0.03);
+  worker.postMessage({ type: 'reset', options: { voxel, colorTopDown: COLOR_TOP_DOWN }, volume });
+  workerBusy = false;
   stopWalking();
-  Object.assign(state, { mode: 'scan', paused: false, sent: 0, dropped: 0, colorFrames: 0, fusion: null, currentId: null });
+  if (!continueFrom) { clearWorld(); state.meta = null; }
+  setWorldMatrix(null);
+  world.visible = !continueFrom; // la malla guardada se muestra cuando la sesión esté alineada
+  Object.assign(state, {
+    mode: 'scan', paused: false, sent: 0, dropped: 0, colorFrames: 0, fusion: null,
+    continuing: !!continueFrom, aligning: !!continueFrom, align: null, volume: null,
+  });
   ui.pause.textContent = 'Pausar';
   ui.sheet.hidden = true;
   ui.overlay.hidden = false;
@@ -231,21 +285,36 @@ async function startScan() {
 
 async function onSessionEnd() {
   ui.overlay.hidden = true;
+  setWorldMatrix(null);
+  world.visible = true;
   state.mode = 'view';
   ui.viewerTitle.textContent = 'Procesando…';
   ui.viewerText.textContent = 'Cerrando la malla y limpiando fragmentos.';
   showSheet('viewer');
+
+  if (state.continuing && state.aligning) {
+    // nunca se alineó: no se integró nada, se deja el escaneo como estaba
+    state.continuing = state.aligning = false;
+    showViewer(state.meta);
+    ui.viewerText.textContent = 'No se logró alinear con el escaneo guardado; no se modificó.';
+    return;
+  }
   await new Promise((res) => { flushResolve = res; worker.postMessage({ type: 'flush' }); });
-  state.hasColor = (state.fusion?.colorFrames ?? 0) > 0;
-  showViewer({ name: 'Escaneo nuevo' });
+  state.hasColor = (state.fusion?.colorFrames ?? 0) > 0 || (state.continuing && state.hasColor);
+  const prev = state.continuing ? state.meta : null;
+  state.continuing = false;
+  showViewer(prev ?? { name: 'Escaneo nuevo' });
   if (!chunks.size) return;
   try {
-    const name = `Escaneo ${new Date().toLocaleString('es', { dateStyle: 'short', timeStyle: 'short' })}`;
-    state.currentId = await db.saveScan({
-      name, voxel: state.fusion?.voxel, hasColor: state.hasColor, chunks: [...chunks.values()].map((c) => c.data),
+    const name = prev?.name ?? `Escaneo ${new Date().toLocaleString('es', { dateStyle: 'short', timeStyle: 'short' })}`;
+    const id = await db.saveScan({
+      id: prev?.id, createdAt: prev?.createdAt, name,
+      voxel: state.fusion?.voxel, hasColor: state.hasColor, volume: state.volume,
+      chunks: [...chunks.values()].map((c) => c.data),
     });
-    ui.viewerTitle.textContent = name;
-    ui.viewerText.textContent = 'Guardado en el teléfono. Arrastra para orbitar o pulsa Caminar.';
+    state.meta = { id, name, createdAt: prev?.createdAt ?? Date.now(), voxel: state.fusion?.voxel, hasVolume: !!state.volume };
+    showViewer(state.meta);
+    ui.viewerText.textContent = prev ? 'Escaneo ampliado y guardado.' : 'Guardado en el teléfono. Arrastra para orbitar o pulsa Caminar.';
   } catch (err) {
     logError('save', err);
     ui.viewerText.textContent = `No se pudo guardar: ${err.message}`;
@@ -254,6 +323,20 @@ async function onSessionEnd() {
 
 let fpsFrames = 0, fpsT0 = 0, lastSend = -Infinity;
 
+function depthMessage(type, frame, view, di) {
+  const buffer = di.data.slice(0); // copia: el buffer original sólo vale durante este frame
+  return {
+    msg: {
+      type, buffer, format: frame.session.depthDataFormat,
+      width: di.width, height: di.height, rawToMeters: di.rawValueToMeters,
+      normViewFromNormDepth: Array.from(di.normDepthBufferFromNormView.inverse.matrix),
+      projection: Array.from(view.projectionMatrix),
+      viewMatrix: Array.from(view.transform.matrix),
+    },
+    transfer: [buffer],
+  };
+}
+
 function onXRFrame(time, frame) {
   fpsFrames++;
   if (time - fpsT0 > 1000) { state.fps = +((fpsFrames * 1000) / (time - fpsT0)).toFixed(1); fpsFrames = 0; fpsT0 = time; }
@@ -261,7 +344,8 @@ function onXRFrame(time, frame) {
   const pose = frame.getViewerPose(renderer.xr.getReferenceSpace());
   if (!pose || pose.emulatedPosition) { state.tracking = 'perdido'; return; }
   state.tracking = 'ok';
-  if (state.paused || time - lastSend < SEND_INTERVAL_MS) return;
+  const interval = state.aligning ? ALIGN_INTERVAL_MS : SEND_INTERVAL_MS;
+  if (state.paused || time - lastSend < interval) return;
   if (workerBusy) { state.dropped++; return; }
 
   const view = pose.views[0];
@@ -273,21 +357,18 @@ function onXRFrame(time, frame) {
     return;
   }
   if (!di) return;
-  const format = frame.session.depthDataFormat;
-  const buffer = di.data.slice(0); // copia: el buffer original sólo vale durante este frame
-  state.depth = { width: di.width, height: di.height, format };
-  const msg = {
-    type: 'integrate', buffer, format,
-    width: di.width, height: di.height, rawToMeters: di.rawValueToMeters,
-    normViewFromNormDepth: Array.from(di.normDepthBufferFromNormView.inverse.matrix),
-    projection: Array.from(view.projectionMatrix),
-    viewMatrix: Array.from(view.transform.matrix),
-  };
-  const transfer = [buffer];
+  state.depth = { width: di.width, height: di.height, format: frame.session.depthDataFormat };
   workerBusy = true;
   lastSend = time;
-  state.sent++;
 
+  if (state.aligning) {
+    const { msg, transfer } = depthMessage('align-frame', frame, view, di);
+    worker.postMessage(msg, transfer);
+    return;
+  }
+
+  const { msg, transfer } = depthMessage('integrate', frame, view, di);
+  state.sent++;
   let colorPromise = null;
   try { colorPromise = grabCameraColor(view); } catch (err) { logError('color', err); }
   if (!colorPromise) { worker.postMessage(msg, transfer); return; }
@@ -371,14 +452,16 @@ function showViewer(meta) {
   ui.viewerText.textContent = chunks.size
     ? 'Arrastra para orbitar, pellizca para acercar, o pulsa Caminar.'
     : 'No se capturó geometría. Prueba de nuevo moviéndote más despacio.';
-  const f = state.fusion;
+  const voxel = meta?.voxel ?? state.fusion?.voxel;
   ui.viewerStats.textContent = [
     `${tris.toLocaleString('es')} triángulos`,
-    meta?.voxel || f?.voxel ? `voxel ${Math.round((meta?.voxel ?? f.voxel) * 100)} cm` : null,
+    voxel ? `voxel ${Math.round(voxel * 100)} cm` : null,
     state.hasColor ? 'con color' : 'sin color',
     state.removedTris ? `${state.removedTris.toLocaleString('es')} tri sueltos eliminados` : null,
   ].filter(Boolean).join(' · ');
-  ui.walk.disabled = ui.exportBtn.disabled = !chunks.size;
+  const has = chunks.size > 0;
+  ui.walk.disabled = ui.exportBtn.disabled = ui.share.disabled = !has;
+  ui.cont.hidden = !meta?.hasVolume;
   showSheet('viewer');
 }
 
@@ -386,21 +469,24 @@ function startWalking() {
   const box = new THREE.Box3().setFromObject(world);
   if (box.isEmpty()) return;
   const floor = estimateFloor() ?? box.min.y;
+  const collider = new Collider([...chunks.values()].map((c) => c.data), floor);
   // empezar donde empezó el escaneo (origen) si está dentro del recinto; si no, en el centro
   const center = box.getCenter(new THREE.Vector3());
   const inside = box.min.x < 0 && box.max.x > 0 && box.min.z < 0 && box.max.z > 0;
+  let [sx, sz] = inside ? [0, 0] : [center.x, center.z];
+  [sx, sz] = collider.nearestFree(sx, sz);
   // ojos a 1.5 m o, si se escaneó poca altura, a 3/4 de lo escaneado (para quedar "dentro")
   const eye = Math.min(EYE_HEIGHT, Math.max(0.6, (box.max.y - floor) * 0.75));
-  const start = new THREE.Vector3(inside ? 0 : center.x, floor + eye, inside ? 0 : center.z);
   camera.near = 0.02;
   camera.far = 100;
   camera.updateProjectionMatrix();
   controls.enabled = false;
-  walk.start(start, 0);
+  walk.collider = collider;
+  walk.start(new THREE.Vector3(sx, floor + eye, sz), 0);
   state.walking = true;
   ui.walk.textContent = 'Orbitar';
   ui.sheet.hidden = true;
-  ui.walkExit.hidden = false;
+  ui.walkBar.hidden = false;
   ui.walkHint.hidden = false;
   setTimeout(() => { ui.walkHint.hidden = true; }, 4000);
 }
@@ -411,29 +497,53 @@ function stopWalking() {
   state.walking = false;
   ui.walk.textContent = 'Caminar';
   ui.walkHint.hidden = true;
-  ui.walkExit.hidden = true;
+  ui.walkBar.hidden = true;
   if (state.mode === 'view') ui.sheet.hidden = false;
   controls.enabled = true;
   frameCamera();
 }
 
+async function buildGlb() {
+  const prev = currentMaterial;
+  setMaterial(state.hasColor ? materials.color : materials.shade);
+  try {
+    return await new GLTFExporter().parseAsync(world, { binary: true });
+  } finally {
+    setMaterial(prev);
+  }
+}
+
+const fileSlug = () => (state.meta?.name ?? 'escaneo').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '').toLowerCase() || 'escaneo';
+
 async function exportGlb() {
   ui.exportBtn.disabled = true;
-  const prev = currentMaterial;
   try {
-    setMaterial(state.hasColor ? materials.color : materials.shade);
-    const glb = await new GLTFExporter().parseAsync(world, { binary: true });
-    const blob = new Blob([glb], { type: 'model/gltf-binary' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `vision-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.glb`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    const glb = await buildGlb();
+    await shareOrDownload(glb, `${fileSlug()}.glb`, 'model/gltf-binary');
   } catch (err) {
     logError('export', err);
   } finally {
-    setMaterial(prev);
     ui.exportBtn.disabled = false;
+  }
+}
+
+async function shareScan() {
+  ui.share.disabled = true;
+  const prevText = ui.share.textContent;
+  ui.share.textContent = 'Preparando…';
+  try {
+    const glb = await buildGlb();
+    const html = await buildViewerHtml(glb, state.meta?.name ?? 'Escaneo 3D');
+    const r = await shareOrDownload(html, `${fileSlug()}.html`, 'text/html');
+    ui.viewerText.textContent = r === 'downloaded'
+      ? 'Se descargó un .html con el visor: envíalo y se abre en cualquier navegador.'
+      : r === 'shared' ? 'Compartido como página .html (se abre en cualquier navegador).' : ui.viewerText.textContent;
+  } catch (err) {
+    logError('share', err);
+    ui.viewerText.textContent = `No se pudo compartir: ${err.message}`;
+  } finally {
+    ui.share.textContent = prevText;
+    ui.share.disabled = false;
   }
 }
 
@@ -461,7 +571,12 @@ async function renderSaved() {
     name.textContent = s.name;
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = `${Math.round(s.triangles).toLocaleString('es')} tri · ${(s.bytes / 1e6).toFixed(1)} MB${s.hasColor ? ' · color' : ''}`;
+    meta.textContent = [
+      `${Math.round(s.triangles).toLocaleString('es')} tri`,
+      `${(s.bytes / 1e6).toFixed(1)} MB`,
+      s.hasColor ? 'color' : null,
+      s.hasVolume ? 'ampliable' : null,
+    ].filter(Boolean).join(' · ');
     info.append(name, meta);
     const open = document.createElement('button');
     open.className = 'small';
@@ -480,7 +595,7 @@ async function renderSaved() {
         return;
       }
       await db.deleteScan(s.id).catch((err) => logError('db', err));
-      if (state.currentId === s.id) { clearWorld(); state.currentId = null; }
+      if (state.meta?.id === s.id) { clearWorld(); state.meta = null; }
       renderSaved();
     });
     row.append(info, open, del);
@@ -493,7 +608,7 @@ async function openScan(id) {
     const scan = await db.loadScan(id);
     if (!scan) return;
     applyMeshes(scan.chunks, true);
-    state.currentId = id;
+    state.meta = scan;
     state.hasColor = !!scan.hasColor;
     state.removedTris = 0;
     state.fusion = null;
@@ -503,38 +618,83 @@ async function openScan(id) {
   }
 }
 
+async function importFromFile(file) {
+  ui.homeText.textContent = `Abriendo ${file.name}…`;
+  try {
+    const r = await importFile(file);
+    applyMeshes(r.chunks, true);
+    state.hasColor = r.hasColor;
+    state.removedTris = 0;
+    state.fusion = null;
+    const id = await db.saveScan({ name: r.name, hasColor: r.hasColor, chunks: r.chunks });
+    state.meta = { id, name: r.name, hasVolume: false };
+    showViewer(state.meta);
+    ui.viewerText.textContent = 'Importado y guardado. Los escaneos importados no se pueden continuar.';
+  } catch (err) {
+    logError('import', err);
+    ui.homeText.textContent = `No se pudo abrir el archivo: ${err.message}`;
+  }
+}
+
 // ---------------------------------------------------------------- HUD
 
 setInterval(() => {
   if (state.mode !== 'scan') return;
   const f = state.fusion;
+  let alignLine = '';
+  if (state.continuing) {
+    const a = state.align;
+    alignLine = state.aligning
+      ? `alineando… ${a?.pending ? `${a.frames}/${a.needed} frames` : a ? `intento ${a.attempts}: ${Math.round((a.inlierRatio ?? 0) * 100)}% coincide` : ''}`
+      : `alineado ✓ ${a ? `${Math.round(a.inlierRatio * 100)}% · ${(a.rms * 100).toFixed(1)} cm` : ''}`;
+  }
   ui.hud.textContent = [
     `fps ${state.fps}   tracking ${state.tracking}${state.paused ? '   PAUSA' : ''}`,
+    alignLine,
     `depth ${state.depth ? `${state.depth.width}x${state.depth.height}` : '-'}   color ${state.colorFrames ? `ok ${state.colorMs.toFixed(0)} ms` : '-'}`,
     `fusión ${state.integrateMs.toFixed(1)} ms   malla ${state.meshMs.toFixed(1)} ms`,
     f ? `bloques ${f.blocks}   tri ${f.triangles.toLocaleString('es')}   ${f.memoryMB} MB` : 'bloques -',
     state.errors.length ? `ERROR: ${state.errors.at(-1)}` : '',
   ].filter(Boolean).join('\n');
-  ui.hint.hidden = state.tracking === 'ok';
-  ui.hint.textContent = 'Tracking perdido: mueve el teléfono despacio y apunta a zonas con textura';
+  if (state.tracking !== 'ok') {
+    ui.hint.hidden = false;
+    ui.hint.textContent = 'Tracking perdido: mueve el teléfono despacio y apunta a zonas con textura';
+  } else if (state.aligning) {
+    ui.hint.hidden = false;
+    ui.hint.textContent = 'Ponte donde empezaste el escaneo y apunta a zonas ya escaneadas';
+  } else {
+    ui.hint.hidden = true;
+  }
 }, 250);
 
 // ---------------------------------------------------------------- botones
 
-ui.scan.addEventListener('click', startScan);
-ui.newBtn.addEventListener('click', startScan);
+ui.scan.addEventListener('click', () => startScan());
+ui.newBtn.addEventListener('click', () => startScan());
+ui.cont.addEventListener('click', () => state.meta && startScan(state.meta));
 ui.pause.addEventListener('click', () => {
   state.paused = !state.paused;
   ui.pause.textContent = state.paused ? 'Reanudar' : 'Pausar';
 });
 ui.stop.addEventListener('click', () => renderer.xr.getSession()?.end());
 ui.exportBtn.addEventListener('click', exportGlb);
+ui.share.addEventListener('click', shareScan);
 ui.homeBtn.addEventListener('click', () => showHome());
 ui.walk.addEventListener('click', () => (state.walking ? stopWalking() : startWalking()));
 ui.walkExit.addEventListener('click', stopWalking);
+ui.collide.addEventListener('click', () => {
+  walk.collide = !walk.collide;
+  ui.collide.textContent = `Colisiones: ${walk.collide ? 'sí' : 'no'}`;
+});
 ui.shade.addEventListener('click', () => {
   setMaterial(currentMaterial === materials.color ? materials.shade : materials.color);
   ui.shade.textContent = currentMaterial === materials.color ? 'Sombreado' : 'Color';
+});
+ui.importBtn.addEventListener('click', () => ui.fileInput.click());
+ui.fileInput.addEventListener('change', () => {
+  const file = ui.fileInput.files?.[0];
+  ui.fileInput.value = '';
+  if (file) importFromFile(file);
 });
 
 // ---------------------------------------------------------------- arranque
@@ -542,7 +702,7 @@ ui.shade.addEventListener('click', () => {
 (async () => {
   const ok = navigator.xr && await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
   if (!ok) {
-    await showHome('Este navegador no soporta WebXR immersive-ar. Usa Chrome en Android con ARCore. Puedes abrir escaneos guardados.');
+    await showHome('Este navegador no soporta WebXR immersive-ar. Puedes abrir escaneos guardados o archivos .glb/.html.');
     return;
   }
   ui.scan.disabled = false;

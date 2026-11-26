@@ -19,6 +19,8 @@ export class WalkControls {
     this.joy = null;         // { id, x0, y0, dx, dy }
     this.look = null;        // { id, x, y }
     this.keys = new Set();
+    this.collider = null;    // { move(x, z, dx, dz) -> [x, z] } o null (sin colisiones)
+    this.collide = true;
 
     dom.addEventListener('pointerdown', (e) => this._down(e));
     addEventListener('pointermove', (e) => this._move(e));
@@ -57,8 +59,14 @@ export class WalkControls {
     const s = this.speed * dt;
     const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
     // adelante = -Z rotado por yaw; derecha = +X rotado por yaw
-    this.camera.position.x += (-sin * fwd + cos * side) * s;
-    this.camera.position.z += (-cos * fwd - sin * side) * s;
+    const dx = (-sin * fwd + cos * side) * s;
+    const dz = (-cos * fwd - sin * side) * s;
+    const p = this.camera.position;
+    if (this.collide && this.collider) {
+      [p.x, p.z] = this.collider.move(p.x, p.z, dx, dz);
+    } else {
+      p.x += dx; p.z += dz;
+    }
     this._apply();
   }
 
