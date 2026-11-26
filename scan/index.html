@@ -61,11 +61,19 @@
   #walk-hint { position: fixed; z-index: 1; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
     background: rgba(0,0,0,.55); border-radius: 999px; padding: 6px 14px; font-size: 12px; color: #fff; pointer-events: none; white-space: nowrap; }
 </style>
+<!-- __BUILD__ lo reemplaza el workflow de deploy por el hash del commit: cada versión de la
+     página carga sus propios módulos aunque la caché de Pages (10 min) tenga otros.
+     Todo módulo local nuevo debe añadirse aquí. -->
 <script type="importmap">
 {
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+    "./walk.js": "./walk.js?v=__BUILD__",
+    "./collider.js": "./collider.js?v=__BUILD__",
+    "./share.js": "./share.js?v=__BUILD__",
+    "./db.js": "./db.js?v=__BUILD__",
+    "./fusion-core.js": "./fusion-core.js?v=__BUILD__"
   }
 }
 </script>
@@ -126,6 +134,6 @@
   </div>
 </div>
 
-<script type="module" src="main.js"></script>
+<script type="module" src="main.js?v=__BUILD__"></script>
 </body>
 </html>

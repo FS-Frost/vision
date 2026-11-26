@@ -1,6 +1,12 @@
 // Web Worker: recibe mapas de profundidad (+ color) y poses, fusiona y devuelve mallas por supercelda.
 // También guarda/carga el volumen TSDF y alinea una sesión nueva con un escaneo guardado.
-import { Fusion } from './fusion-core.js';
+// El worker no ve el import map de la página: importa el núcleo con su misma versión (?v=...)
+// para no mezclar módulos de deploys distintos que estén en caché.
+let Fusion;
+const ready = import(`./fusion-core.js${self.location.search}`).then((m) => {
+  Fusion = m.Fusion;
+  fusion = new Fusion();
+});
 
 const MESH_INTERVAL_MS = 250;
 const MESH_BUDGET_MS = 30;
@@ -10,7 +16,7 @@ const ALIGN_OPTS = { minRatio: 0.35, maxRms: 0.025 };
 const AGREE_YAW = 0.02;       // rad: dos soluciones consecutivas deben coincidir
 const AGREE_T = 0.03;         // m
 
-let fusion = new Fusion();
+let fusion = null;
 let lastMesh = 0;
 let alignFrames = [];
 let alignAttempts = 0;
@@ -39,8 +45,14 @@ function frameFrom(m) {
   };
 }
 
+// los mensajes que llegan antes de cargar el núcleo esperan en orden (misma promesa)
 self.onmessage = (ev) => {
-  const m = ev.data;
+  ready.then(() => handle(ev.data)).catch((err) => {
+    self.postMessage({ type: 'error', message: `carga del núcleo: ${err.message}` });
+  });
+};
+
+function handle(m) {
   try {
     switch (m.type) {
       case 'reset':
@@ -131,4 +143,4 @@ self.onmessage = (ev) => {
   } catch (err) {
     self.postMessage({ type: 'error', message: `${err.name}: ${err.message}`, stack: err.stack });
   }
-};
+}

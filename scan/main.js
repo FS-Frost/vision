@@ -159,7 +159,9 @@ addEventListener('resize', () => {
 
 // ---------------------------------------------------------------- worker
 
-const worker = new Worker(new URL('./fusion-worker.js', import.meta.url), { type: 'module' });
+// el worker no ve el import map: se le pasa la misma versión (?v=...) con la que cargó main.js
+const BUILD_QUERY = new URL(import.meta.url).search;
+const worker = new Worker(new URL(`./fusion-worker.js${BUILD_QUERY}`, import.meta.url), { type: 'module' });
 let workerBusy = false;
 let flushResolve = null;
 

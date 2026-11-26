@@ -85,9 +85,15 @@ Brave **no** sirve: oculta WebGPU y elimina la API de profundidad CPU.
 
 ### Deploy
 
-GitHub Pages sirve `main` desde la raíz (`.nojekyll` incluido). Cada push a `main` se publica en 1–2 minutos.
+Cada push a `main` dispara el workflow [`.github/workflows/pages.yml`](.github/workflows/pages.yml):
 
-Pages manda `Cache-Control: max-age=600`. Durante unos 10 minutos tras un deploy, el navegador puede mezclar un HTML nuevo con módulos JS viejos. Para probar enseguida, recarga sin caché: por CDP, `Network.setCacheDisabled` + `Page.reload {ignoreCache: true}`.
+1. Corre los tests (`node --test`). Si fallan, no se publica.
+2. Sella la versión: reemplaza `__BUILD__` por los primeros 8 caracteres del hash del commit.
+3. Publica en GitHub Pages (1–2 minutos).
+
+Pages manda `Cache-Control: max-age=600`. Sin el sello, el navegador podía mezclar módulos de deploys distintos. Con él, cada `scan/index.html` carga `main.js?v=<hash>`; el import map remapea los demás módulos locales a la misma versión, y el worker hereda la query de `main.js` para importar el núcleo. El propio HTML puede seguir en caché hasta 10 minutos, pero siempre trae su propio conjunto coherente de módulos.
+
+En local (`npx serve` / `adb reverse`), `__BUILD__` queda literal en la query y funciona igual.
 
 ### Tests
 

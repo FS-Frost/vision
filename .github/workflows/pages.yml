@@ -1,0 +1,53 @@
+# Deploy a GitHub Pages: corre los tests, sella la versión de los módulos y publica.
+# No es un build: solo reemplaza __BUILD__ por el hash del commit para que cada versión
+# de la página cargue sus propios módulos aunque la caché de Pages (10 min) tenga otros.
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Tests
+        run: node --test tests/*.test.mjs
+
+      - name: Sellar versión de módulos
+        run: |
+          BUILD="${GITHUB_SHA::8}"
+          grep -rl --exclude-dir=.git --exclude-dir=.github "__BUILD__" . | xargs -r sed -i "s/__BUILD__/${BUILD}/g"
+          if grep -rq --exclude-dir=.git --exclude-dir=.github "__BUILD__" .; then
+            echo "Quedó __BUILD__ sin reemplazar" >&2
+            exit 1
+          fi
+          echo "Versión sellada: ${BUILD}"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
