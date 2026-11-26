@@ -549,7 +549,9 @@ async function startAR() {
 
     if (tStart === null) tStart = time;
     s.frames++;
-    const pose = frame.getViewerPose(refSpace);
+    let pose = null;
+    try {
+    pose = frame.getViewerPose(refSpace);
     if (!pose) {
       s.lostFrames++;
     } else {
@@ -585,6 +587,10 @@ async function startAR() {
         }
       }
     }
+    } catch (err) {
+      s.frameErrors = (s.frameErrors || 0) + 1;
+      s.frameError = `${err.name}: ${err.message} @ ${(err.stack || '').split('\n')[1]?.trim() ?? ''}`;
+    }
 
     if (time - lastUi > 250) {
       lastUi = time;
@@ -602,6 +608,7 @@ async function startAR() {
         `depth upd: ${s.depth.updateHz ?? '-'} Hz  válido ${s.depth.validRatio ?? '-'}`,
         `depth centro: ${s.depth.centerM ?? '-'} m  [${s.depth.minM ?? '-'}..${s.depth.maxM ?? '-'}]`,
         `cámara: ${s.camera.width ? `${s.camera.width}x${s.camera.height}` : 'no'} img ${s.camera.imageOk ? 'OK' : '-'}`,
+        s.frameError ? `ERROR (${s.frameErrors}): ${s.frameError}` : '',
       ].join('\n');
     }
   }
@@ -610,6 +617,10 @@ async function startAR() {
     overlay.hidden = true;
     showArResult();
   });
+  hud.textContent = 'Sesión AR abierta. Esperando primer frame de ARCore…';
+  setTimeout(() => {
+    if (s.frames === 0) hud.textContent = 'Sin frames tras 10 s. ARCore no entrega imagen. Pulsa Terminar.';
+  }, 10000);
   session.requestAnimationFrame(onFrame);
 }
 
@@ -638,6 +649,7 @@ function showArResult() {
     kv('sec-ar', 'Depth error', s.depth.error);
     kv('sec-ar', 'Cámara resolución', s.camera.width ? `${s.camera.width}x${s.camera.height}` : null);
     kv('sec-ar', 'Cámara error', s.camera.error);
+    if (s.frameError) kv('sec-ar', `Error en frame (${s.frameErrors})`, s.frameError, 'bad');
   }
   renderSummary();
   updateJson();
