@@ -6,11 +6,17 @@ const MESH_INTERVAL_MS = 250;
 const MESH_BUDGET_MS = 30;
 const ALIGN_MIN_FRAMES = 5;   // frames acumulados antes de intentar alinear
 const ALIGN_WINDOW = 10;      // ventana deslizante de frames para alinear
+const ALIGN_OPTS = { minRatio: 0.35, maxRms: 0.025 };
+const AGREE_YAW = 0.02;       // rad: dos soluciones consecutivas deben coincidir
+const AGREE_T = 0.03;         // m
 
 let fusion = new Fusion();
 let lastMesh = 0;
 let alignFrames = [];
 let alignAttempts = 0;
+let candidate = null;         // última solución "ok" aún no confirmada
+
+const agrees = (a, b) => Math.abs(a.yaw - b.yaw) < AGREE_YAW && Math.hypot(a.t[0] - b.t[0], a.t[1] - b.t[1], a.t[2] - b.t[2]) < AGREE_T;
 
 function send(type, extra, meshes = []) {
   const transfer = [];
@@ -36,6 +42,7 @@ self.onmessage = (ev) => {
         lastMesh = 0;
         alignFrames = [];
         alignAttempts = 0;
+        candidate = null;
         if (m.volume) fusion.importVolume(m.volume);
         send('reset', { imported: !!m.volume });
         break;
@@ -66,11 +73,22 @@ self.onmessage = (ev) => {
         let o = 0;
         for (const a of alignFrames) { pts.set(a, o); o += a.length; }
         const t0 = performance.now();
-        const r = fusion.alignPoints(pts);
+        // con un candidato: refinar desde él con una sola semilla (rápido); si no, búsqueda multi-yaw
+        const r = candidate
+          ? fusion.alignPoints(pts, { ...ALIGN_OPTS, yaws: [0], initial: [candidate.yaw, ...candidate.t], levels: [0.2, 0.12, 0.08, 0.05] })
+          : fusion.alignPoints(pts, ALIGN_OPTS);
         alignAttempts++;
-        if (r.ok) fusion.setAlign(r.matrix);
+        // aceptar sólo si dos soluciones consecutivas coinciden (evita falsos positivos)
+        let ok = false;
+        if (r.ok) {
+          ok = !!candidate && agrees(candidate, r);
+          candidate = r;
+        } else {
+          candidate = null;
+        }
+        if (ok) fusion.setAlign(r.matrix);
         self.postMessage({
-          type: 'aligned', ok: r.ok, matrix: r.matrix, yaw: r.yaw, t: r.t,
+          type: 'aligned', ok, candidate: r.ok && !ok, matrix: r.matrix, yaw: r.yaw, t: r.t,
           inlierRatio: r.inlierRatio, rms: r.rms, reason: r.reason, attempts: alignAttempts,
           ms: performance.now() - t0,
         });

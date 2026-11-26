@@ -320,3 +320,22 @@ test('colisiones: no se atraviesan paredes y se desliza contra ellas', () => {
   const [fx, fz] = col.nearestFree(0.45, -1.15);
   assert.equal(col.blocked(fx, fz), false);
 });
+
+test('alineación: refinar desde un candidato converge con una sola semilla', () => {
+  const saved = new Fusion({ voxel: 0.04 });
+  scanRoom(saved);
+  const A = yawMatrix(-0.1, -0.08, 0.0, 0.12);
+  const Ainv = invertRigid(A);
+  const pts = [];
+  for (const [yaw, pitch] of [[0.2, -0.35], [-0.4, -0.3], [0.6, -0.4]]) {
+    const Mw = pose(yaw, pitch, 0, 1.3, 0);
+    pts.push(...saved.samplePoints(frameOf(roomDepth(Mw), mul4(Ainv, Mw))));
+  }
+  // candidato con error de ~3 cm y ~1.5°
+  const r = saved.alignPoints(Float32Array.from(pts), {
+    yaws: [0], initial: [-0.075, -0.05, 0.01, 0.1], levels: [0.2, 0.12, 0.08, 0.05], minRatio: 0.35,
+  });
+  assert.ok(r.ok);
+  assert.ok(Math.abs(r.yaw + 0.1) < 0.015, `yaw ${r.yaw}`);
+  assert.ok(Math.hypot(r.t[0] + 0.08, r.t[1], r.t[2] - 0.12) < 0.03, `t ${r.t}`);
+});

@@ -12,11 +12,18 @@ Web app estática que escanea una habitación con la cámara del teléfono y con
 Prototipo funcional:
 
 - Escaneo en vivo con color de cámara.
-- Visor orbital y paseo en primera persona (joystick virtual).
-- Guardado automático en IndexedDB y exportación `.glb`.
+- Visor orbital y paseo en primera persona (joystick virtual) con colisiones.
+- Guardado automático en IndexedDB, exportación `.glb` e importación de `.glb`/`.html`.
+- Compartir como `.html` autocontenido (visor three.js + modelo en base64), que se abre en cualquier navegador.
+- Continuar un escaneo guardado: se guarda el volumen TSDF y la sesión nueva se alinea con la malla guardada. La ampliación se guarda como escaneo nuevo y el original se conserva.
 - Calidad: voxel de 3 cm, filtro de ruido, cierre de huecos pequeños y limpieza de fragmentos.
 
-Ideas siguientes: colisiones en el paseo, continuar un escaneo guardado, texturas en lugar de color por vértice y compartir escaneos.
+Limitaciones conocidas:
+
+- Continuar exige empezar cerca del punto de inicio del escaneo original (unos 50 cm y 40°), porque la alineación no hace búsqueda global.
+- Las superficies lisas sin textura (techo, paredes blancas) dan profundidad poco fiable y pueden generar capas duplicadas.
+
+Ideas siguientes: texturas en lugar de color por vértice, relocalización global para continuar desde cualquier punto y simplificación de mallas grandes.
 
 ## Arquitectura
 
@@ -88,7 +95,10 @@ Pages manda `Cache-Control: max-age=600`. Durante unos 10 minutos tras un deploy
 node --test tests/*.test.mjs
 ```
 
-Los tests cubren el núcleo de fusión: posición de la superficie, normales, orientación, costuras entre bloques (con y sin dilatación), cámara rotada, orientación del color, limpieza de fragmentos y rendimiento.
+Los tests cubren:
+
+- Núcleo de fusión: posición de la superficie, normales, orientación, costuras entre bloques (con y sin dilatación), cámara rotada, orientación del color, limpieza de fragmentos y rendimiento.
+- Sobre una habitación sintética con raycasting: ida y vuelta del volumen, alineación entre sesiones (recuperación, rechazo de datos ajenos y refinamiento) y colisiones con deslizamiento.
 
 ### Probar en el teléfono con depuración remota
 
@@ -112,7 +122,9 @@ index.html              landing
 scan/index.html         escáner (UI + import map de three.js)
 scan/main.js            sesión XR, color de cámara, render, visor, guardado, exportación
 scan/walk.js            paseo en primera persona (joystick virtual / WASD)
-scan/db.js              IndexedDB: stores meta (listado) y data (geometría)
+scan/collider.js        colisiones: grilla 2D de ocupación inflada con el radio del jugador
+scan/share.js           visor .html autocontenido para compartir; importación de .glb/.html
+scan/db.js              IndexedDB v2: stores meta (listado), data (geometría) y volume (TSDF)
 scan/fusion-worker.js   worker: mensajes integrate / flush / reset
 scan/fusion-core.js     TSDF disperso + color + Surface Nets + limpieza (sin DOM, testeable en Node)
 diag/index.html         diagnóstico de capacidades (autocontenido)

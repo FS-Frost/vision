@@ -306,15 +306,19 @@ async function onSessionEnd() {
   showViewer(prev ?? { name: 'Escaneo nuevo' });
   if (!chunks.size) return;
   try {
-    const name = prev?.name ?? `Escaneo ${new Date().toLocaleString('es', { dateStyle: 'short', timeStyle: 'short' })}`;
+    // una continuación se guarda como escaneo nuevo: el original se conserva por si la alineación falló
+    const stamp = new Date().toLocaleString('es', { dateStyle: 'short', timeStyle: 'short' });
+    const name = prev ? `${prev.name.replace(/ \+ ampliado.*$/, '')} + ampliado ${stamp}` : `Escaneo ${stamp}`;
     const id = await db.saveScan({
-      id: prev?.id, createdAt: prev?.createdAt, name,
+      name,
       voxel: state.fusion?.voxel, hasColor: state.hasColor, volume: state.volume,
       chunks: [...chunks.values()].map((c) => c.data),
     });
-    state.meta = { id, name, createdAt: prev?.createdAt ?? Date.now(), voxel: state.fusion?.voxel, hasVolume: !!state.volume };
+    state.meta = { id, name, createdAt: Date.now(), voxel: state.fusion?.voxel, hasVolume: !!state.volume };
     showViewer(state.meta);
-    ui.viewerText.textContent = prev ? 'Escaneo ampliado y guardado.' : 'Guardado en el teléfono. Arrastra para orbitar o pulsa Caminar.';
+    ui.viewerText.textContent = prev
+      ? 'Ampliación guardada como escaneo nuevo; el original se conserva en Mis escaneos.'
+      : 'Guardado en el teléfono. Arrastra para orbitar o pulsa Caminar.';
   } catch (err) {
     logError('save', err);
     ui.viewerText.textContent = `No se pudo guardar: ${err.message}`;
@@ -645,7 +649,7 @@ setInterval(() => {
   if (state.continuing) {
     const a = state.align;
     alignLine = state.aligning
-      ? `alineando… ${a?.pending ? `${a.frames}/${a.needed} frames` : a ? `intento ${a.attempts}: ${Math.round((a.inlierRatio ?? 0) * 100)}% coincide` : ''}`
+      ? `alineando… ${a?.pending ? `${a.frames}/${a.needed} frames` : a ? `intento ${a.attempts}: ${Math.round((a.inlierRatio ?? 0) * 100)}% coincide${a.candidate ? ', confirmando' : ''}` : ''}`
       : `alineado ✓ ${a ? `${Math.round(a.inlierRatio * 100)}% · ${(a.rms * 100).toFixed(1)} cm` : ''}`;
   }
   ui.hud.textContent = [
