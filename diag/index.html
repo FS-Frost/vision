@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vision · Diagnóstico</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --line: #262a33; --text: #e6e8ee; --muted: #8b93a3;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --info: #58a6ff;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+  h2 { font-size: 15px; margin: 0 0 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  dl { display: grid; grid-template-columns: minmax(110px, 40%) 1fr; gap: 4px 10px; margin: 0; }
+  dt { color: var(--muted); overflow-wrap: anywhere; }
+  dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; font-size: 12.5px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--muted); }
+  .ok .dot { background: var(--ok); } .warn .dot { background: var(--warn); }
+  .bad .dot { background: var(--bad); } .info .dot { background: var(--info); }
+  button {
+    font: inherit; font-weight: 600; color: #fff; background: #2f6feb; border: 0; border-radius: 8px;
+    padding: 10px 14px; min-height: 44px; cursor: pointer;
+  }
+  button:disabled { background: #30363d; color: var(--muted); cursor: default; }
+  button.secondary { background: #30363d; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .note { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; }
+  details pre { overflow-x: auto; background: #0b0d11; padding: 10px; border-radius: 8px; font-size: 11.5px; max-height: 50vh; }
+
+  /* Overlay visible durante la sesión AR (dom-overlay) */
+  #xr-overlay {
+    position: fixed; inset: 0; pointer-events: none;
+    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; justify-content: space-between;
+  }
+  #xr-overlay .hud {
+    pointer-events: auto; background: rgba(0,0,0,.6); border-radius: 10px; padding: 10px;
+    font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre; color: #fff;
+  }
+  #xr-overlay .bottom { display: flex; justify-content: space-between; align-items: flex-end; gap: 8px; }
+  #depth-canvas { pointer-events: none; width: 40vw; max-width: 240px; image-rendering: pixelated; border: 1px solid #fff4; background: #000; }
+  #xr-overlay button { pointer-events: auto; background: #da3633; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Vision · Diagnóstico</h1>
+  <p class="sub">Comprueba si este dispositivo puede ejecutar el escáner 3D (WebGPU + WebXR/ARCore).</p>
+
+  <section id="sec-summary">
+    <h2>Veredicto</h2>
+    <dl id="summary"></dl>
+  </section>
+
+  <section id="sec-env"><h2>Entorno</h2><dl></dl></section>
+
+  <section id="sec-webgpu">
+    <h2>WebGPU <button id="btn-bench" class="secondary" disabled>Benchmark TSDF</button></h2>
+    <dl></dl>
+    <p class="note">El benchmark integra una grilla de 128³ voxels (≈2M, 16 MB) con un compute shader parecido a la fusión TSDF real, 30 veces.</p>
+  </section>
+
+  <section id="sec-webgl"><h2>WebGL2</h2><dl></dl></section>
+
+  <section id="sec-webxr">
+    <h2>WebXR <button id="btn-ar" disabled>Probar sesión AR</button></h2>
+    <dl></dl>
+    <p class="note">La prueba AR pide cámara. Mueve el teléfono despacio por la habitación unos 20–30 s y pulsa «Terminar». Si no ves el panel durante la sesión, usa el botón Atrás del sistema para salir.</p>
+  </section>
+
+  <section id="sec-ar" hidden><h2>Resultado sesión AR</h2><dl></dl></section>
+
+  <section>
+    <h2>Reporte</h2>
+    <div class="row">
+      <button id="btn-copy">Copiar reporte JSON</button>
+      <button id="btn-share" class="secondary" hidden>Compartir</button>
+    </div>
+    <details><summary class="note">Ver JSON</summary><pre id="json"></pre></details>
+  </section>
+</main>
+
+<div id="xr-overlay" hidden>
+  <div class="hud" id="hud">Iniciando…</div>
+  <div class="bottom">
+    <canvas id="depth-canvas" width="160" height="90"></canvas>
+    <button id="btn-end">Terminar</button>
+  </div>
+</div>
+
+<script type="module">
+const $ = (s) => document.querySelector(s);
+
+const report = {
+  generatedAt: new Date().toISOString(),
+  env: {}, webgpu: {}, webgl: {}, webxr: {}, gpuBench: null, arSession: null,
+};
+
+// ---------- UI helpers ----------
+function kv(sectionId, label, value, status = '') {
+  const dl = $(`#${sectionId} dl`);
+  const dt = document.createElement('dt');
+  const dd = document.createElement('dd');
+  dt.textContent = label;
+  if (status) {
+    dd.className = status;
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    dd.append(dot);
+  }
+  dd.append(document.createTextNode(fmt(value)));
+  dl.append(dt, dd);
+}
+function clear(sectionId) { $(`#${sectionId} dl`).replaceChildren(); }
+function fmt(v) {
+  if (v === undefined || v === null || v === '') return '—';
+  if (typeof v === 'boolean') return v ? 'sí' : 'no';
+  if (Array.isArray(v)) return v.length ? v.join(', ') : '(ninguno)';
+  if (typeof v === 'number') return Number.isInteger(v) ? v.toLocaleString('es') : v.toFixed(2);
+  return String(v);
+}
+function updateJson() { $('#json').textContent = JSON.stringify(report, null, 2); }
+
+// ---------- Entorno ----------
+async function checkEnv() {
+  const e = report.env;
+  e.userAgent = navigator.userAgent;
+  e.secureContext = window.isSecureContext;
+  e.hardwareConcurrency = navigator.hardwareConcurrency ?? null;
+  e.deviceMemoryGB = navigator.deviceMemory ?? null;
+  e.screen = `${screen.width}x${screen.height} @${devicePixelRatio}x`;
+  if (navigator.userAgentData?.getHighEntropyValues) {
+    try {
+      const h = await navigator.userAgentData.getHighEntropyValues(['model', 'platform', 'platformVersion', 'fullVersionList']);
+      e.model = h.model || null;
+      e.platform = `${h.platform} ${h.platformVersion}`;
+      e.browser = (h.fullVersionList || []).map((b) => `${b.brand} ${b.version}`).join(', ');
+    } catch { /* sin datos extra */ }
+  }
+  kv('sec-env', 'Contexto seguro', e.secureContext, e.secureContext ? 'ok' : 'bad');
+  kv('sec-env', 'Modelo', e.model);
+  kv('sec-env', 'Plataforma', e.platform);
+  kv('sec-env', 'Navegador', e.browser || e.userAgent);
+  kv('sec-env', 'Núcleos CPU', e.hardwareConcurrency);
+  kv('sec-env', 'Memoria (GB, aprox.)', e.deviceMemoryGB);
+  kv('sec-env', 'Pantalla', e.screen);
+}
+
+// ---------- WebGPU ----------
+let gpuAdapter = null;
+const LIMIT_KEYS = [
+  'maxBufferSize', 'maxStorageBufferBindingSize', 'maxStorageBuffersPerShaderStage',
+  'maxComputeWorkgroupStorageSize', 'maxComputeInvocationsPerWorkgroup',
+  'maxComputeWorkgroupSizeX', 'maxComputeWorkgroupsPerDimension', 'maxTextureDimension2D',
+  'maxTextureDimension3D',
+];
+
+async function checkWebGPU() {
+  const g = report.webgpu;
+  g.available = 'gpu' in navigator;
+  kv('sec-webgpu', 'navigator.gpu', g.available, g.available ? 'ok' : 'bad');
+  if (!g.available) return;
+  try {
+    gpuAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  } catch (err) {
+    g.adapterError = String(err);
+  }
+  g.adapter = !!gpuAdapter;
+  kv('sec-webgpu', 'Adapter', gpuAdapter ? 'obtenido' : (g.adapterError || 'null'), gpuAdapter ? 'ok' : 'bad');
+  if (!gpuAdapter) return;
+
+  let info = gpuAdapter.info;
+  if (!info && gpuAdapter.requestAdapterInfo) {
+    try { info = await gpuAdapter.requestAdapterInfo(); } catch { info = null; }
+  }
+  info = info || {};
+  g.adapterInfo = {
+    vendor: info.vendor || null, architecture: info.architecture || null,
+    device: info.device || null, description: info.description || null,
+  };
+  g.isFallbackAdapter = gpuAdapter.isFallbackAdapter ?? info.isFallbackAdapter ?? null;
+  g.features = [...gpuAdapter.features].sort();
+  g.limits = Object.fromEntries(LIMIT_KEYS.map((k) => [k, gpuAdapter.limits[k]]));
+  g.preferredCanvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+  kv('sec-webgpu', 'Vendor / arquitectura', `${g.adapterInfo.vendor ?? '?'} / ${g.adapterInfo.architecture ?? '?'}`);
+  kv('sec-webgpu', 'Descripción', g.adapterInfo.description || g.adapterInfo.device);
+  kv('sec-webgpu', 'Adapter fallback (software)', g.isFallbackAdapter, g.isFallbackAdapter ? 'bad' : 'ok');
+  kv('sec-webgpu', 'Formato canvas', g.preferredCanvasFormat);
+  kv('sec-webgpu', 'Features', g.features);
+  for (const k of LIMIT_KEYS) kv('sec-webgpu', k, g.limits[k]);
+  $('#btn-bench').disabled = false;
+}
+
+const TSDF_WGSL = /* wgsl */`
+struct Params {
+  dim: u32, voxel: f32, trunc: f32, _pad: f32,
+  cam: vec4f,
+};
+@group(0) @binding(0) var<storage, read_write> vox: array<vec2f>; // (tsdf, peso)
+@group(0) @binding(1) var<uniform> P: Params;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) g: vec3u) {
+  if (any(g >= vec3u(P.dim))) { return; }
+  let i = g.x + g.y * P.dim + g.z * P.dim * P.dim;
+  let p = (vec3f(g) + 0.5) * P.voxel - P.cam.xyz;
+  if (p.z <= 0.05) { return; }
+  let uv = p.xy / p.z;
+  if (any(abs(uv) > vec2f(0.8))) { return; }
+  // profundidad sintética: superficie ondulada a ~1.5 m
+  let d = 1.5 + 0.2 * sin(uv.x * 10.0) * cos(uv.y * 10.0);
+  let sdf = d - p.z;
+  if (sdf < -P.trunc) { return; }
+  let t = min(1.0, sdf / P.trunc);
+  var v = vox[i];
+  let w = v.y + 1.0;
+  v.x = (v.x * v.y + t) / w;
+  v.y = min(w, 64.0);
+  vox[i] = v;
+}`;
+
+async function runGpuBench() {
+  const btn = $('#btn-bench');
+  btn.disabled = true;
+  btn.textContent = 'Midiendo…';
+  const res = { dim: 128, iterations: 30 };
+  try {
+    const device = await gpuAdapter.requestDevice();
+    device.lost.then((i) => { res.deviceLost = i.message; });
+    device.pushErrorScope('validation');
+    const dim = res.dim, n = dim ** 3;
+    const vox = device.createBuffer({ size: n * 8, usage: GPUBufferUsage.STORAGE });
+    const ubo = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const module = device.createShaderModule({ code: TSDF_WGSL });
+    const pipeline = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    const bind = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: vox } }, { binding: 1, resource: { buffer: ubo } }],
+    });
+    const params = new ArrayBuffer(32);
+    const dv = new DataView(params);
+    dv.setUint32(0, dim, true);
+    dv.setFloat32(4, 0.03, true);  // 3 cm/voxel => cubo de 3.84 m
+    dv.setFloat32(8, 0.1, true);   // truncamiento 10 cm
+    const groups = Math.ceil(dim / 4);
+
+    const step = (k) => {
+      dv.setFloat32(16, 1.92 + 0.01 * Math.sin(k), true);
+      dv.setFloat32(20, 1.92, true);
+      dv.setFloat32(24, -1.0, true);
+      device.queue.writeBuffer(ubo, 0, params);
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bind);
+      pass.dispatchWorkgroups(groups, groups, groups);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    };
+
+    for (let k = 0; k < 3; k++) step(k); // calentamiento
+    await device.queue.onSubmittedWorkDone();
+
+    const t0 = performance.now();
+    for (let k = 0; k < res.iterations; k++) {
+      step(k);
+      await device.queue.onSubmittedWorkDone(); // un frame = una integración, como en el escáner
+    }
+    const total = performance.now() - t0;
+    const err = await device.popErrorScope();
+    if (err) throw new Error(err.message);
+
+    res.msPerIntegration = +(total / res.iterations).toFixed(2);
+    res.mVoxelsPerSecond = +((n * res.iterations) / (total / 1000) / 1e6).toFixed(1);
+    res.maxIntegrationHz = +(1000 / res.msPerIntegration).toFixed(1);
+    device.destroy();
+  } catch (err) {
+    res.error = String(err?.message || err);
+  }
+  report.gpuBench = res;
+  btn.textContent = 'Repetir benchmark';
+  btn.disabled = false;
+  if (res.error) {
+    kv('sec-webgpu', 'Benchmark', res.error, 'bad');
+  } else {
+    const st = res.msPerIntegration < 20 ? 'ok' : res.msPerIntegration < 60 ? 'warn' : 'bad';
+    kv('sec-webgpu', 'Benchmark: ms por integración 128³', res.msPerIntegration, st);
+    kv('sec-webgpu', 'Benchmark: Mvoxels/s', res.mVoxelsPerSecond);
+    kv('sec-webgpu', 'Benchmark: Hz máx. de fusión', res.maxIntegrationHz);
+  }
+  renderSummary();
+  updateJson();
+}
+
+// ---------- WebGL2 ----------
+function checkWebGL() {
+  const w = report.webgl;
+  const gl = document.createElement('canvas').getContext('webgl2');
+  w.available = !!gl;
+  kv('sec-webgl', 'WebGL2', w.available, w.available ? 'ok' : 'bad');
+  if (!gl) return;
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  w.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  w.vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+  w.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  w.max3DTextureSize = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+  w.colorBufferFloat = !!gl.getExtension('EXT_color_buffer_float');
+  kv('sec-webgl', 'Renderer', w.renderer);
+  kv('sec-webgl', 'Vendor', w.vendor);
+  kv('sec-webgl', 'MAX_TEXTURE_SIZE', w.maxTextureSize);
+  kv('sec-webgl', 'MAX_3D_TEXTURE_SIZE', w.max3DTextureSize);
+  kv('sec-webgl', 'EXT_color_buffer_float', w.colorBufferFloat);
+}
+
+// ---------- WebXR ----------
+async function checkWebXR() {
+  const x = report.webxr;
+  x.available = 'xr' in navigator;
+  kv('sec-webxr', 'navigator.xr', x.available, x.available ? 'ok' : 'bad');
+  if (!x.available) return;
+  x.sessionSupport = {};
+  for (const mode of ['immersive-ar', 'immersive-vr', 'inline']) {
+    try { x.sessionSupport[mode] = await navigator.xr.isSessionSupported(mode); }
+    catch (err) { x.sessionSupport[mode] = `error: ${err.message}`; }
+  }
+  x.XRWebGLBinding = typeof XRWebGLBinding !== 'undefined';
+  x.getCameraImage = x.XRWebGLBinding && 'getCameraImage' in XRWebGLBinding.prototype;
+  x.getDepthInfo = typeof XRFrame !== 'undefined' && 'getDepthInfo' in XRFrame.prototype;
+  const ar = x.sessionSupport['immersive-ar'] === true;
+  kv('sec-webxr', 'immersive-ar (ARCore)', x.sessionSupport['immersive-ar'], ar ? 'ok' : 'bad');
+  kv('sec-webxr', 'immersive-vr', x.sessionSupport['immersive-vr']);
+  kv('sec-webxr', 'API depth (XRFrame.getDepthInfo)', x.getDepthInfo, x.getDepthInfo ? 'ok' : 'warn');
+  kv('sec-webxr', 'API camera (getCameraImage)', x.getCameraImage, x.getCameraImage ? 'ok' : 'warn');
+  $('#btn-ar').disabled = !ar;
+}
+
+// ---------- Sesión AR ----------
+const OPTIONAL_FEATURES = [
+  'depth-sensing', 'camera-access', 'dom-overlay', 'hit-test', 'plane-detection',
+  'anchors', 'light-estimation', 'local-floor', 'unbounded',
+];
+const DEPTH_VARIANTS = [
+  { usagePreference: ['cpu-optimized', 'gpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32', 'unsigned-short'] },
+  { usagePreference: ['cpu-optimized', 'gpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] },
+];
+
+async function requestArSession(overlay) {
+  let lastErr;
+  for (const depthSensing of DEPTH_VARIANTS) {
+    try {
+      return await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['local'],
+        optionalFeatures: OPTIONAL_FEATURES,
+        domOverlay: { root: overlay },
+        depthSensing,
+      });
+    } catch (err) {
+      lastErr = err;
+      if (err.name !== 'TypeError') break; // sólo reintenta si el enum no es reconocido
+    }
+  }
+  throw lastErr;
+}
+
+function safe(fn, fallback = null) { try { return fn(); } catch { return fallback; } }
+
+async function startAR() {
+  const overlay = $('#xr-overlay');
+  const hud = $('#hud');
+  overlay.hidden = false;
+
+  const canvas = document.createElement('canvas');
+  const gl = canvas.getContext('webgl2', { xrCompatible: true, alpha: true });
+
+  let session;
+  try {
+    session = await requestArSession(overlay);
+  } catch (err) {
+    overlay.hidden = true;
+    report.arSession = { error: `${err.name}: ${err.message}` };
+    showArResult();
+    return;
+  }
+
+  $('#btn-end').onclick = () => session.end();
+  session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+  const refSpace = await session.requestReferenceSpace('local');
+  const binding = typeof XRWebGLBinding !== 'undefined' ? new XRWebGLBinding(session, gl) : null;
+
+  const s = report.arSession = {
+    enabledFeatures: session.enabledFeatures ? [...session.enabledFeatures] : null,
+    depthUsage: safe(() => session.depthUsage),
+    depthDataFormat: safe(() => session.depthDataFormat),
+    domOverlayType: safe(() => session.domOverlayState?.type),
+    durationS: 0, frames: 0, fps: null,
+    trackedFrames: 0, emulatedFrames: 0, lostFrames: 0, pathMeters: 0,
+    depth: { framesWithInfo: 0, updates: 0, updateHz: null, width: null, height: null, rawValueToMeters: null,
+      minM: null, maxM: null, validRatio: null, centerM: null, error: null },
+    camera: { width: null, height: null, imageOk: false, error: null },
+  };
+
+  const dctx = $('#depth-canvas').getContext('2d');
+  let tStart = null, lastPos = null, lastUi = 0, lastSig = null;
+
+  function analyzeDepth(di) {
+    const w = di.width, h = di.height, k = di.rawValueToMeters;
+    const arr = s.depthDataFormat === 'float32' ? new Float32Array(di.data) : new Uint16Array(di.data);
+    const dc = dctx.canvas;
+    if (dc.width !== w || dc.height !== h) { dc.width = w; dc.height = h; }
+    const img = dctx.createImageData(w, h);
+    let min = Infinity, max = 0, valid = 0;
+    for (let i = 0; i < w * h; i++) {
+      const m = arr[i] * k;
+      const o = i * 4;
+      if (m > 0) {
+        valid++; if (m < min) min = m; if (m > max) max = m;
+        const v = Math.max(0, Math.min(255, 255 - (m / 5) * 255)); // cerca = claro, 5 m = negro
+        img.data[o] = v; img.data[o + 1] = v; img.data[o + 2] = v;
+      } else {
+        img.data[o] = 120; img.data[o + 1] = 0; img.data[o + 2] = 0; // inválido = rojo
+      }
+      img.data[o + 3] = 255;
+    }
+    dctx.putImageData(img, 0, 0);
+    s.depth.minM = valid ? +min.toFixed(3) : null;
+    s.depth.maxM = valid ? +max.toFixed(3) : null;
+    s.depth.validRatio = +(valid / (w * h)).toFixed(3);
+    s.depth.centerM = safe(() => +di.getDepthInMeters(0.5, 0.5).toFixed(3));
+  }
+
+  function depthSignature(di) {
+    const arr = s.depthDataFormat === 'float32' ? new Float32Array(di.data) : new Uint16Array(di.data);
+    let sum = 0;
+    const stride = Math.max(1, Math.floor(arr.length / 64));
+    for (let i = 0; i < arr.length; i += stride) sum += arr[i];
+    return sum;
+  }
+
+  function onFrame(time, frame) {
+    session.requestAnimationFrame(onFrame);
+    const layer = session.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    if (tStart === null) tStart = time;
+    s.frames++;
+    const pose = frame.getViewerPose(refSpace);
+    if (!pose) {
+      s.lostFrames++;
+    } else {
+      if (pose.emulatedPosition) s.emulatedFrames++; else s.trackedFrames++;
+      const p = pose.transform.position;
+      if (lastPos) s.pathMeters += Math.hypot(p.x - lastPos.x, p.y - lastPos.y, p.z - lastPos.z);
+      lastPos = { x: p.x, y: p.y, z: p.z };
+      const view = pose.views[0];
+
+      // Profundidad
+      let di = null;
+      try {
+        if (s.depthUsage === 'gpu-optimized') di = binding?.getDepthInformation(view);
+        else if (s.depthUsage === 'cpu-optimized') di = frame.getDepthInfo(view);
+      } catch (err) { s.depth.error = `${err.name}: ${err.message}`; }
+      if (di) {
+        s.depth.framesWithInfo++;
+        s.depth.width = di.width; s.depth.height = di.height;
+        s.depth.rawValueToMeters = di.rawValueToMeters;
+        if (s.depthUsage === 'cpu-optimized') {
+          const sig = depthSignature(di);
+          if (sig !== lastSig) { s.depth.updates++; lastSig = sig; }
+          if (s.frames % 6 === 0) analyzeDepth(di);
+        }
+      }
+
+      // Cámara
+      if (view.camera) {
+        s.camera.width = view.camera.width; s.camera.height = view.camera.height;
+        if (!s.camera.imageOk && binding?.getCameraImage) {
+          try { s.camera.imageOk = !!binding.getCameraImage(view.camera); }
+          catch (err) { s.camera.error = `${err.name}: ${err.message}`; }
+        }
+      }
+    }
+
+    if (time - lastUi > 250) {
+      lastUi = time;
+      const secs = (time - tStart) / 1000;
+      s.durationS = +secs.toFixed(1);
+      s.fps = secs > 0 ? +(s.frames / secs).toFixed(1) : null;
+      s.depth.updateHz = secs > 0 ? +(s.depth.updates / secs).toFixed(1) : null;
+      const pos = lastPos ? `${lastPos.x.toFixed(2)}, ${lastPos.y.toFixed(2)}, ${lastPos.z.toFixed(2)}` : '—';
+      hud.textContent = [
+        `t ${s.durationS}s   fps ${s.fps}`,
+        `tracking: ${pose ? (pose.emulatedPosition ? 'EMULADO (3DoF)' : 'OK 6DoF') : 'PERDIDO'}`,
+        `pos (m): ${pos}`,
+        `recorrido: ${s.pathMeters.toFixed(2)} m`,
+        `depth: ${s.depthUsage ?? 'no'} ${s.depth.width ?? '-'}x${s.depth.height ?? '-'} ${s.depthDataFormat ?? ''}`,
+        `depth upd: ${s.depth.updateHz ?? '-'} Hz  válido ${s.depth.validRatio ?? '-'}`,
+        `depth centro: ${s.depth.centerM ?? '-'} m  [${s.depth.minM ?? '-'}..${s.depth.maxM ?? '-'}]`,
+        `cámara: ${s.camera.width ? `${s.camera.width}x${s.camera.height}` : 'no'} img ${s.camera.imageOk ? 'OK' : '-'}`,
+      ].join('\n');
+    }
+  }
+
+  session.addEventListener('end', () => {
+    overlay.hidden = true;
+    showArResult();
+  });
+  session.requestAnimationFrame(onFrame);
+}
+
+function showArResult() {
+  const s = report.arSession;
+  const sec = $('#sec-ar');
+  sec.hidden = false;
+  clear('sec-ar');
+  if (s.error) {
+    kv('sec-ar', 'Error', s.error, 'bad');
+  } else {
+    const has = (f) => s.enabledFeatures?.includes(f);
+    kv('sec-ar', 'Features concedidas', s.enabledFeatures ?? 'n/d (enabledFeatures no soportado)');
+    kv('sec-ar', 'depth-sensing', s.depthUsage ? `${s.depthUsage} / ${s.depthDataFormat}` : 'no', s.depthUsage ? 'ok' : 'bad');
+    kv('sec-ar', 'camera-access', has('camera-access') || s.camera.width ? 'sí' : 'no', s.camera.imageOk ? 'ok' : 'warn');
+    kv('sec-ar', 'dom-overlay', s.domOverlayType ?? 'no', s.domOverlayType ? 'ok' : 'warn');
+    kv('sec-ar', 'Duración (s)', s.durationS);
+    kv('sec-ar', 'FPS sesión', s.fps, s.fps >= 25 ? 'ok' : 'warn');
+    const trackedPct = s.frames ? s.trackedFrames / s.frames : 0;
+    kv('sec-ar', 'Frames con tracking 6DoF', `${s.trackedFrames}/${s.frames} (${(trackedPct * 100).toFixed(0)}%)`, trackedPct > 0.8 ? 'ok' : 'warn');
+    kv('sec-ar', 'Recorrido (m)', +s.pathMeters.toFixed(2));
+    kv('sec-ar', 'Depth resolución', s.depth.width ? `${s.depth.width}x${s.depth.height}` : null);
+    kv('sec-ar', 'Depth actualizaciones (Hz)', s.depth.updateHz);
+    kv('sec-ar', 'Depth % válido (última muestra)', s.depth.validRatio);
+    kv('sec-ar', 'Depth rango (m)', s.depth.minM != null ? `${s.depth.minM} – ${s.depth.maxM}` : null);
+    kv('sec-ar', 'Depth error', s.depth.error);
+    kv('sec-ar', 'Cámara resolución', s.camera.width ? `${s.camera.width}x${s.camera.height}` : null);
+    kv('sec-ar', 'Cámara error', s.camera.error);
+  }
+  renderSummary();
+  updateJson();
+}
+
+// ---------- Veredicto ----------
+function renderSummary() {
+  clear('sec-summary');
+  const g = report.webgpu, x = report.webxr, a = report.arSession, b = report.gpuBench;
+  const gpuOk = g.adapter && !g.isFallbackAdapter;
+  kv('sec-summary', 'Compute (WebGPU)', gpuOk ? 'disponible' : 'no disponible', gpuOk ? 'ok' : 'bad');
+  if (b && !b.error) {
+    kv('sec-summary', 'Fusión TSDF estimada', `${b.maxIntegrationHz} Hz máx. (128³)`, b.maxIntegrationHz >= 10 ? 'ok' : b.maxIntegrationHz >= 3 ? 'warn' : 'bad');
+  } else {
+    kv('sec-summary', 'Fusión TSDF estimada', 'ejecuta el benchmark', 'info');
+  }
+  const arOk = x.sessionSupport?.['immersive-ar'] === true;
+  kv('sec-summary', 'Tracking 6DoF (ARCore)', arOk ? 'soportado' : 'no soportado', arOk ? 'ok' : 'bad');
+  if (!a) {
+    kv('sec-summary', 'Profundidad', arOk ? 'ejecuta la prueba AR' : 'sin AR', arOk ? 'info' : 'bad');
+  } else if (a.error) {
+    kv('sec-summary', 'Profundidad', `fallo sesión: ${a.error}`, 'bad');
+  } else {
+    kv('sec-summary', 'Profundidad', a.depthUsage ? `${a.depth.width}x${a.depth.height} @ ${a.depth.updateHz ?? '?'} Hz` : 'NO disponible', a.depthUsage ? 'ok' : 'bad');
+    kv('sec-summary', 'Color de cámara', a.camera.imageOk ? 'disponible' : 'no', a.camera.imageOk ? 'ok' : 'warn');
+  }
+  let verdict, st;
+  if (!gpuOk || !arOk) { verdict = 'Camino A (WebXR+ARCore+WebGPU) NO viable tal cual'; st = 'bad'; }
+  else if (!a) { verdict = 'Prometedor: falta la prueba AR'; st = 'info'; }
+  else if (a.error || !a.depthUsage) { verdict = 'Tracking sí, profundidad no: requeriría depth monocular (camino B)'; st = 'warn'; }
+  else { verdict = 'Camino A viable'; st = 'ok'; }
+  kv('sec-summary', 'Veredicto', verdict, st);
+}
+
+// ---------- Reporte ----------
+$('#btn-copy').addEventListener('click', async () => {
+  const text = JSON.stringify(report, null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+    $('#btn-copy').textContent = 'Copiado ✓';
+  } catch {
+    $('#btn-copy').textContent = 'No se pudo copiar: abre «Ver JSON»';
+  }
+  setTimeout(() => { $('#btn-copy').textContent = 'Copiar reporte JSON'; }, 2500);
+});
+if (navigator.share) {
+  const btn = $('#btn-share');
+  btn.hidden = false;
+  btn.addEventListener('click', () => {
+    navigator.share({ title: 'Vision diagnóstico', text: JSON.stringify(report, null, 2) }).catch(() => {});
+  });
+}
+
+$('#btn-bench').addEventListener('click', runGpuBench);
+$('#btn-ar').addEventListener('click', startAR);
+
+// ---------- Inicio ----------
+await checkEnv();
+checkWebGL();
+await checkWebGPU();
+await checkWebXR();
+renderSummary();
+updateJson();
+</script>
+</body>
+</html>
