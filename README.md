@@ -4,31 +4,39 @@ Web app estática que escanea una habitación con la cámara del teléfono y con
 
 **Sitio:** https://fs-frost.github.io/vision/
 
-- [Escáner](https://fs-frost.github.io/vision/scan/): recorre la habitación, mira la malla crecer sobre la cámara, orbita el resultado y exporta a `.glb`.
+- [Escáner](https://fs-frost.github.io/vision/scan/): recorre la habitación, mira la malla crecer sobre la cámara y luego orbita o camina por el resultado con color real. Los escaneos se guardan en el teléfono y se exportan a `.glb`.
 - [Diagnóstico](https://fs-frost.github.io/vision/diag/): comprueba las capacidades del dispositivo (WebGPU, WebXR/ARCore, profundidad, cámara, benchmarks).
 
 ## Estado
 
-Prototipo funcional: escaneo en vivo, visor orbital y exportación `.glb`.
+Prototipo funcional:
 
-Pendiente: color desde `camera-access`, navegación en primera persona, persistencia en IndexedDB y mejor cierre de huecos.
+- Escaneo en vivo con color de cámara.
+- Visor orbital y paseo en primera persona (joystick virtual).
+- Guardado automático en IndexedDB y exportación `.glb`.
+- Calidad: voxel de 3 cm, filtro de ruido, cierre de huecos pequeños y limpieza de fragmentos.
+
+Ideas siguientes: colisiones en el paseo, continuar un escaneo guardado, texturas en lugar de color por vértice y compartir escaneos.
 
 ## Arquitectura
 
 ```
 WebXR immersive-ar (ARCore)
-  ├─ pose 6DoF por frame          (XRViewerPose, espacio 'local')
-  └─ profundidad CPU 160x90       (XRFrame.getDepthInformation, luminance-alpha)
-        │  ~10 Hz, ArrayBuffer transferido
+  ├─ pose 6DoF por frame          (XRViewerPose, espacio 'local-floor' o 'local')
+  ├─ profundidad CPU 160x90       (XRFrame.getDepthInformation, luminance-alpha)
+  └─ imagen de cámara             (camera-access → render target 120 px → lectura asíncrona)
+        │  ~10 Hz, ArrayBuffers transferidos
         ▼
 Web Worker (scan/fusion-worker.js → scan/fusion-core.js)
-  ├─ fusión TSDF dispersa         bloques 8³, voxel 4 cm, truncamiento 3 voxels
-  └─ Surface Nets por bloque      fusionado en superceldas 4³ (pocas draw calls)
-        │  geometrías por supercelda cada ~250 ms
+  ├─ fusión TSDF dispersa         bloques 8³, voxel 3 cm, truncamiento 3 voxels, color sRGB por voxel
+  ├─ Surface Nets por bloque      peso mínimo 2, dilatación de 1 voxel (ventana 12³), color por vértice
+  └─ malla final                  elimina componentes conexas pequeñas
+        │  geometrías por supercelda 4³ cada ~250 ms
         ▼
 Hilo principal (scan/main.js, three.js 0.180)
   ├─ malla semitransparente sobre la cámara durante el escaneo
-  └─ visor OrbitControls + GLTFExporter al terminar
+  ├─ visor: OrbitControls o paseo (walk.js), color sin iluminación o sombreado
+  └─ guardado en IndexedDB (db.js) y GLTFExporter
 ```
 
 ### Decisiones
@@ -41,10 +49,11 @@ Hilo principal (scan/main.js, three.js 0.180)
 
 | Parámetro | Por defecto | Efecto |
 |---|---|---|
-| `voxel` | `0.04` | Tamaño de voxel en metros |
+| `voxel` | selector (3 cm) | Tamaño de voxel en metros; sustituye al selector de calidad |
 | `hz` | `10` | Frecuencia máxima de integración de profundidad |
+| `colorTopDown` | `0` | `1` invierte la orientación vertical de la imagen de cámara (si el color sale volteado en otro dispositivo) |
 
-Ejemplo: `scan/?voxel=0.03&hz=8`.
+Ejemplo: `scan/?voxel=0.025&hz=8`.
 
 ## Resultados en el moto g54 (Chrome 158, Android 15)
 
@@ -55,7 +64,8 @@ Ejemplo: `scan/?voxel=0.03&hz=8`.
 | Cámara | 864×1920 |
 | WebGPU | Sin adapter (blocklist PowerVR) |
 | Benchmark TSDF CPU | ~4 ms por 100k actualizaciones de voxel |
-| Escaneo real | 171 frames, 203 bloques, ~15k triángulos, 0,8 MB |
+| Escaneo real (voxel 4 cm, sin color) | 171 frames, 203 bloques, ~15k triángulos, 0,8 MB |
+| Escaneo real (voxel 3 cm, con color) | 126 frames, 563 bloques, ~87k triángulos, fusión ~10–18 ms, lectura de color ~13–35 ms (asíncrona) |
 
 Brave **no** sirve: oculta WebGPU y elimina la API de profundidad CPU.
 
@@ -70,13 +80,15 @@ Brave **no** sirve: oculta WebGPU y elimina la API de profundidad CPU.
 
 GitHub Pages sirve `main` desde la raíz (`.nojekyll` incluido). Cada push a `main` se publica en 1–2 minutos.
 
+Pages manda `Cache-Control: max-age=600`. Durante unos 10 minutos tras un deploy, el navegador puede mezclar un HTML nuevo con módulos JS viejos. Para probar enseguida, recarga sin caché: por CDP, `Network.setCacheDisabled` + `Page.reload {ignoreCache: true}`.
+
 ### Tests
 
 ```bash
 node --test tests/*.test.mjs
 ```
 
-Los tests cubren el núcleo de fusión: posición de la superficie, normales, orientación, costuras entre bloques, cámara rotada y rendimiento.
+Los tests cubren el núcleo de fusión: posición de la superficie, normales, orientación, costuras entre bloques (con y sin dilatación), cámara rotada, orientación del color, limpieza de fragmentos y rendimiento.
 
 ### Probar en el teléfono con depuración remota
 
@@ -98,9 +110,11 @@ Si hay varios navegadores Chromium instalados (por ejemplo Brave), `chrome_devto
 ```
 index.html              landing
 scan/index.html         escáner (UI + import map de three.js)
-scan/main.js            sesión XR, render, visor, exportación
+scan/main.js            sesión XR, color de cámara, render, visor, guardado, exportación
+scan/walk.js            paseo en primera persona (joystick virtual / WASD)
+scan/db.js              IndexedDB: stores meta (listado) y data (geometría)
 scan/fusion-worker.js   worker: mensajes integrate / flush / reset
-scan/fusion-core.js     TSDF disperso + Surface Nets (sin DOM, testeable en Node)
+scan/fusion-core.js     TSDF disperso + color + Surface Nets + limpieza (sin DOM, testeable en Node)
 diag/index.html         diagnóstico de capacidades (autocontenido)
 tests/                  tests de node:test
 ```
