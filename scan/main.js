@@ -10,7 +10,7 @@ const params = new URLSearchParams(location.search);
 const SEND_INTERVAL_MS = 1000 / (parseFloat(params.get('hz')) || 10);
 const COLOR_TOP_DOWN = params.get('colorTopDown') === '1';
 const COLOR_WIDTH = 120;   // ancho de la imagen de color leída de la GPU
-const EYE_HEIGHT = 1.55;   // m sobre el suelo en modo paseo
+const EYE_HEIGHT = 1.5;    // m sobre el suelo en modo paseo (máximo)
 
 const $ = (s) => document.querySelector(s);
 const ui = {
@@ -20,7 +20,7 @@ const ui = {
   viewer: $('#viewer'), viewerTitle: $('#viewer-title'), viewerText: $('#viewer-text'), viewerStats: $('#viewer-stats'),
   walk: $('#btn-walk'), shade: $('#btn-shade'), exportBtn: $('#btn-export'), homeBtn: $('#btn-home'), newBtn: $('#btn-new'),
   overlay: $('#overlay'), hud: $('#hud'), hint: $('#hint'), pause: $('#btn-pause'), stop: $('#btn-stop'),
-  joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
+  joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'), walkExit: $('#btn-walk-exit'),
 };
 if (params.get('voxel')) {
   const opt = new Option(`${parseFloat(params.get('voxel')) * 100} cm (URL)`, params.get('voxel'));
@@ -389,7 +389,9 @@ function startWalking() {
   // empezar donde empezó el escaneo (origen) si está dentro del recinto; si no, en el centro
   const center = box.getCenter(new THREE.Vector3());
   const inside = box.min.x < 0 && box.max.x > 0 && box.min.z < 0 && box.max.z > 0;
-  const start = new THREE.Vector3(inside ? 0 : center.x, floor + EYE_HEIGHT, inside ? 0 : center.z);
+  // ojos a 1.5 m o, si se escaneó poca altura, a 3/4 de lo escaneado (para quedar "dentro")
+  const eye = Math.min(EYE_HEIGHT, Math.max(0.6, (box.max.y - floor) * 0.75));
+  const start = new THREE.Vector3(inside ? 0 : center.x, floor + eye, inside ? 0 : center.z);
   camera.near = 0.02;
   camera.far = 100;
   camera.updateProjectionMatrix();
@@ -397,6 +399,8 @@ function startWalking() {
   walk.start(start, 0);
   state.walking = true;
   ui.walk.textContent = 'Orbitar';
+  ui.sheet.hidden = true;
+  ui.walkExit.hidden = false;
   ui.walkHint.hidden = false;
   setTimeout(() => { ui.walkHint.hidden = true; }, 4000);
 }
@@ -407,6 +411,8 @@ function stopWalking() {
   state.walking = false;
   ui.walk.textContent = 'Caminar';
   ui.walkHint.hidden = true;
+  ui.walkExit.hidden = true;
+  if (state.mode === 'view') ui.sheet.hidden = false;
   controls.enabled = true;
   frameCamera();
 }
@@ -525,6 +531,7 @@ ui.stop.addEventListener('click', () => renderer.xr.getSession()?.end());
 ui.exportBtn.addEventListener('click', exportGlb);
 ui.homeBtn.addEventListener('click', () => showHome());
 ui.walk.addEventListener('click', () => (state.walking ? stopWalking() : startWalking()));
+ui.walkExit.addEventListener('click', stopWalking);
 ui.shade.addEventListener('click', () => {
   setMaterial(currentMaterial === materials.color ? materials.shade : materials.color);
   ui.shade.textContent = currentMaterial === materials.color ? 'Sombreado' : 'Color';
