@@ -18,11 +18,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  # Dos jobs como la plantilla oficial: subir el artefacto y desplegarlo en el mismo job
+  # falló de forma intermitente ("No artifacts named github-pages were found").
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,5 +48,12 @@ jobs:
         with:
           path: .
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4
