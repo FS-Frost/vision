@@ -42,6 +42,7 @@ const ui = {
   startPhotoBox: $('#start-photo-box'), startPhoto: $('#start-photo'),
   crosshair: $('#crosshair'), crosshairDist: $('#crosshair-dist'), anchorBtn: $('#btn-anchor'),
   anchorPanel: $('#anchor-panel'), anchorPhoto: $('#anchor-photo'), anchorText: $('#anchor-text'),
+  anchorRef: $('#anchor-ref'), anchorCap: $('#anchor-cap'), anchorLive: $('#anchor-live'),
   anchorMark: $('#btn-anchor-mark'), anchorUse: $('#btn-anchor-use'), anchorRedo: $('#btn-anchor-redo'), anchorSkip: $('#btn-anchor-skip'), relocRetry: $('#btn-reloc-retry'),
   joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
   walkBar: $('#walk-bar'), walkExit: $('#btn-walk-exit'), collide: $('#btn-collide'),
@@ -505,6 +506,7 @@ function onXRFrame(time, frame) {
   const pose = frame.getViewerPose(renderer.xr.getReferenceSpace());
   if (!pose || pose.emulatedPosition) { state.tracking = 'perdido'; return; }
   state.tracking = 'ok';
+  { const c = pose.views[0].transform.position; state.camPos = [c.x, c.y, c.z]; }
   updateCrosshair(frame, pose.views[0]);
   if (state.pendingAnchorPhoto != null) grabAnchorPhoto(pose.views[0]);
   const rl = state.continuing ? state.reloc : null;
@@ -675,7 +677,7 @@ function markCaptureAnchor() {
   if (!cap) return;
   if (!state.hit) { flashHint('Apunta la mirilla a una superficie (se pone verde) y vuelve a tocar'); return; }
   if (cap.anchors.length >= MAX_ANCHORS) return;
-  cap.anchors.push({ p: state.hit, photo: null });
+  cap.anchors.push({ p: state.hit, photo: null, dist: state.hitDist, cam: state.camPos });
   state.pendingAnchorPhoto = cap.anchors.length - 1;
   setAnchorMarkers(cap.anchors.map((a) => a.p));
   ui.anchorBtn.textContent = `Ancla ${cap.anchors.length}/${MAX_ANCHORS}`;
@@ -695,8 +697,12 @@ function updateAnchorPanel() {
   const i = rl.anchorHits.length;
   const a = saved[i];
   ui.anchorPanel.hidden = false;
-  if (a?.photo && ui.anchorPhoto.src !== a.photo) { ui.anchorPhoto.src = a.photo; ui.anchorPhoto.classList.remove('big'); }
+  if (a?.photo && ui.anchorPhoto.src !== a.photo) { ui.anchorPhoto.src = a.photo; ui.anchorRef.classList.remove('big'); }
   ui.anchorPhoto.hidden = !a?.photo;
+  ui.anchorRef.hidden = !a;
+  ui.anchorCap.textContent = a
+    ? [a.dist ? `Tomada a ${fmtM(a.dist)}` : null, `altura ${fmtM(a.p[1])}`].filter(Boolean).join(' · ')
+    : '';
   ui.anchorText.textContent = a
     ? `Ancla ${i + 1} de ${saved.length}: apunta la mirilla al punto marcado con la cruz en la foto y toca Marcar`
     : 'Anclas listas';
@@ -722,6 +728,20 @@ function anchorIssues(hit, i) {
     if (Math.abs(dNow - dSaved) > ANCHOR_DIST_TOL) issues.push(`la distancia al ancla ${j + 1} no cuadra (${Math.round(Math.abs(dNow - dSaved) * 100)} cm)`);
   });
   return issues;
+}
+
+const fmtM = (v) => `${v.toFixed(2).replace('.', ',')} m`;
+
+/** Comparación en vivo con el ancla buscada: distancia de la cámara y altura del punto. */
+function updateAnchorLive() {
+  const rl = state.reloc;
+  const a = (state.meta?.anchors ?? [])[rl.anchorHits.length];
+  if (!a || !state.hit) { ui.anchorLive.textContent = state.hit ? '' : 'Ahora: mirilla sin superficie'; return; }
+  const mark = (ok) => `<span class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'}</span>`;
+  const parts = [];
+  if (a.dist) parts.push(`${fmtM(state.hitDist)} ${mark(Math.abs(state.hitDist - a.dist) <= 0.25)}`);
+  parts.push(`altura ${fmtM(state.hit[1])} ${mark(Math.abs(state.hit[1] - a.p[1]) <= ANCHOR_HEIGHT_TOL)}`);
+  ui.anchorLive.innerHTML = 'Ahora: ' + parts.join(' · ');
 }
 
 function markSessionAnchor() {
@@ -1183,6 +1203,7 @@ setInterval(() => {
   const showPhoto = state.continuing && state.reloc?.phase === 'sweep' && !!state.meta?.startPhoto;
   if (showPhoto && ui.startPhoto.src !== state.meta.startPhoto) ui.startPhoto.src = state.meta.startPhoto;
   ui.startPhotoBox.hidden = !showPhoto;
+  if (state.reloc?.phase === 'anchors') updateAnchorLive();
   const showCross = !!state.capture || state.reloc?.phase === 'anchors';
   ui.crosshair.hidden = !showCross;
   ui.crosshairDist.hidden = !showCross;
@@ -1267,7 +1288,7 @@ ui.stop.addEventListener('click', () => {
 });
 ui.anchorBtn.addEventListener('click', markCaptureAnchor);
 // tocar la foto (ancla o inicio) la agranda / la devuelve a la esquina
-ui.anchorPhoto.addEventListener('click', () => ui.anchorPhoto.classList.toggle('big'));
+ui.anchorRef.addEventListener('click', () => ui.anchorRef.classList.toggle('big'));
 ui.startPhotoBox.addEventListener('click', () => ui.startPhotoBox.classList.toggle('big'));
 ui.anchorMark.addEventListener('click', markSessionAnchor);
 ui.anchorUse.addEventListener('click', () => { if (state.reloc?.phase === 'anchors' && state.reloc.anchorHits.length >= 2) solveFromAnchors(); });

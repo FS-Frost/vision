@@ -61,7 +61,10 @@ export async function saveScan({ id, name, voxel, hasColor, chunks, volume, crea
     // pista de inicio: pose de la cámara al empezar (marco del escaneo) y foto pequeña de esa vista
     startPose: startPose ? Array.from(startPose) : null, startPhoto: startPhoto ?? null,
     // anclas: puntos marcados con la mirilla (marco del escaneo) + foto con cruz de cada uno
-    anchors: (anchors ?? []).map((a) => ({ p: Array.from(a.p), photo: a.photo ?? null })),
+    anchors: (anchors ?? []).map((a) => ({
+      p: Array.from(a.p), photo: a.photo ?? null,
+      dist: a.dist ?? null, cam: a.cam ? Array.from(a.cam) : null, // desde dónde se marcó
+    })),
     ...summarize(chunks), createdAt: createdAt ?? Date.now(), updatedAt: Date.now(),
   };
   const tx = db.transaction(['meta', 'data', 'volume'], 'readwrite');
