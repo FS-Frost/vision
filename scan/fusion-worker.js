@@ -124,6 +124,19 @@ function handle(m) {
         resetReloc();
         break;
 
+      case 'reloc-dump':
+        // diagnóstico: devuelve los frames del barrido (sin color) para analizarlos fuera del teléfono
+        self.postMessage({
+          type: 'reloc-dump',
+          frames: relocFrames.map((f) => ({
+            depth: f.depth, width: f.width, height: f.height, rawToMeters: f.rawToMeters,
+            normViewFromNormDepth: Array.from(f.normViewFromNormDepth), projection: Array.from(f.projection),
+            viewMatrix: Array.from(f.viewMatrix),
+          })),
+          sessionFloorFallback: relocFloorFallback,
+        });
+        break;
+
       case 'flush': {
         // malla final completa y limpia (al cerrar la sesión); reemplaza todo
         const t0 = performance.now();

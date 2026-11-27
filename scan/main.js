@@ -169,6 +169,7 @@ const BUILD_QUERY = new URL(import.meta.url).search;
 const worker = new Worker(new URL(`./fusion-worker.js${BUILD_QUERY}`, import.meta.url), { type: 'module' });
 let workerBusy = false;
 let flushResolve = null;
+let dumpResolve = null;
 
 worker.onmessage = (ev) => {
   const m = ev.data;
@@ -192,6 +193,10 @@ worker.onmessage = (ev) => {
     case 'reloc-confirmed':
       workerBusy = false;
       if (state.reloc) Object.assign(state.reloc, { phase: 'done', integrated: m.frames });
+      break;
+    case 'reloc-dump':
+      dumpResolve?.(m);
+      dumpResolve = null;
       break;
     case 'flushed':
       state.meshMs = m.meshMs;
@@ -307,7 +312,14 @@ async function onSessionEnd() {
   showSheet('viewer');
 
   if (state.continuing && state.reloc?.phase !== 'done') {
-    // nunca se confirmó la posición: no se integró nada, se deja el escaneo como estaba
+    // nunca se confirmó la posición: no se integró nada, se deja el escaneo como estaba.
+    // Diagnóstico: conservar el resultado y los frames del barrido (window.vision.lastReloc).
+    const rl = state.reloc;
+    const dump = await new Promise((res) => { dumpResolve = res; worker.postMessage({ type: 'reloc-dump' }); });
+    state.lastReloc = {
+      scanId: state.meta?.id, refSpace: state.refSpace, coverage: rl?.coverage, attempts: rl?.attempts,
+      result: rl?.result, candidates: rl?.candidates ?? [], frames: dump.frames, sessionFloorFallback: dump.sessionFloorFallback,
+    };
     worker.postMessage({ type: 'reloc-reset' });
     state.continuing = false;
     state.reloc = null;
@@ -449,6 +461,7 @@ function onRelocResult(m) {
   const rl = state.reloc;
   if (!rl) return;
   rl.result = { ok: m.ok, ambiguous: m.ambiguous, reason: m.reason, ms: Math.round(m.ms), n: m.candidates.length };
+  rl.candidates = m.candidates; // también si no alcanzan el umbral (diagnóstico)
   if (!m.ok || !m.candidates.length) {
     rl.phase = 'sweep'; // seguir barriendo y reintentar
     return;
