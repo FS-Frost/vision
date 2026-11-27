@@ -13,6 +13,9 @@ const DEG = Math.PI / 180;
  * correcta. minQuality solo descarta datos sin relación con la escena: el resto lo decide el
  * usuario viendo la malla sobre la cámara.
  */
+/** Altura mínima de la cámara sobre el suelo con el teléfono en la mano (m). */
+export const MIN_CAM_ABOVE_FLOOR = 0.8;
+
 export const RELOC_PARAMS = { resTol: 0.05, cosTol: 0.5, visMargin: 0.25, visWeight: 2, minQuality: 0.03, maxShown: 5 };
 
 /** Altura del suelo: percentil bajo de los puntos con normal hacia arriba. */
@@ -383,10 +386,15 @@ function forEachProjected(savedCloud, frames, matrix, maxPoints, cb) {
  */
 export function relocalize(savedCloud, sessionCloud, {
   refine, score, frames = null, sessionFloorFallback = null, method = 'volume', extraSeeds = [],
+  // alturas de cámara (y) conocidas: un "suelo" estimado desde la malla solo es creíble si queda
+  // al menos MIN_CAM_ABOVE_FLOOR por debajo de la cámara (si no, es una cama o una mesa)
+  savedCamY = null, sessionCamY = null, savedFloorFallback = null, floorOverride = null,
   minQuality = RELOC_PARAMS.minQuality, visWeight = RELOC_PARAMS.visWeight, visMargin = RELOC_PARAMS.visMargin,
 } = {}) {
-  const savedFloor = estimateFloor(savedCloud);
-  const sessionFloor = estimateFloor(sessionCloud, sessionFloorFallback);
+  const plausible = (floor, camY, fallback) =>
+    camY == null || camY - floor >= MIN_CAM_ABOVE_FLOOR || fallback == null ? floor : fallback;
+  const savedFloor = floorOverride?.saved ?? plausible(estimateFloor(savedCloud, savedFloorFallback), savedCamY, savedFloorFallback);
+  const sessionFloor = floorOverride?.session ?? plausible(estimateFloor(sessionCloud, sessionFloorFallback), sessionCamY, sessionFloorFallback);
   const dy = savedFloor - sessionFloor;
   let coarse;
   if (method === 'plan') {

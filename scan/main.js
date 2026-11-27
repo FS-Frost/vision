@@ -510,6 +510,7 @@ function onXRFrame(time, frame) {
     worker.postMessage({
       type: 'reloc-solve',
       startGuess: savedStart && rl.sessionStart ? startGuess(savedStart, rl.sessionStart) : null,
+      savedCamY: savedStart ? savedStart[13] : null,
     });
   });
 }

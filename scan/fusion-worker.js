@@ -97,6 +97,10 @@ function handle(m) {
           score: (yaw, t) => fusion.scorePose(sc.pos, sc.nor, yaw, t, { resTol: reloc.RELOC_PARAMS.resTol, cosTol: reloc.RELOC_PARAMS.cosTol }),
           frames: relocFrames.filter((_, i) => i % step === 0),
           sessionFloorFallback: relocFloorFallback,
+          savedFloorFallback: relocFloorFallback,
+          // alturas de cámara para validar los suelos estimados desde la malla
+          sessionCamY: relocFrames.length ? Math.min(...relocFrames.map((f) => f.viewMatrix[13])) : null,
+          savedCamY: m.savedCamY ?? null,
           extraSeeds: m.startGuess ? [m.startGuess] : [],
         });
         // mostrar los mejores y, siempre, el candidato del punto inicial

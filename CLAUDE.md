@@ -35,7 +35,7 @@ Sitio: https://fs-frost.github.io/vision/ (GitHub Pages, publicado por el workfl
   - Barrido guiado obligatorio: entre 6 s (con ≥50 % de direcciones cubiertas) y 15 s.
   - **Toda** alineación al continuar requiere confirmación visual del usuario («Coincide» / «Probar otra»), aunque no haya duda. La app puede **ordenar y recomendar** candidatos por coincidencia en vivo, pero nunca aceptar sola.
   - La confirmación muestra cada candidato como **semáforo**: verde si coincide con la profundidad en vivo (±15 cm, el ruido medido entre sesiones), rojo si la cámara ve a través, gris sin dato. Hay un modo **parpadeo** con colores reales. No se vuelve a la malla azul uniforme: en 3D no permite juzgar la alineación.
-  - La altura del suelo se calcula desde la malla, no se confía en `local-floor`.
+  - La altura del suelo se estima desde la malla, pero solo se acepta si queda ≥ 0,8 m (`MIN_CAM_ABOVE_FLOOR`) bajo la cámara. Si no, se usa `local-floor` (y = 0). Medido en el g54: un barrido que no ve el suelo tomó una cama a 0,67 m como suelo y desplazó 70 cm en vertical a todos los candidatos.
   - Los frames del barrido se integran tras confirmar, no se descartan.
   - **Pista de inicio:** cada escaneo nuevo guarda su pose inicial y una foto pequeña. Al continuar, se muestra la foto y la relocalización **siempre** incluye un candidato que supone que la sesión está en el punto inicial. Es una ayuda: nunca reemplaza la búsqueda global.
   - **Vistas de referencia** (etapa 2, solo si hacen falta): presupuesto máximo de ~3 MB por escaneo.

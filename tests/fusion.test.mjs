@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Fusion, mul4, invertRigid, yawMatrix, depthWeight } from '../scan/fusion-core.js';
 import { Collider } from '../scan/collider.js';
-import { relocalize, RELOC_PARAMS, liveAgreement, startGuess } from '../scan/reloc.js';
+import { relocalize, RELOC_PARAMS, liveAgreement, startGuess, estimateFloor } from '../scan/reloc.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -509,4 +509,29 @@ test('pista de inicio: startGuess recupera la transformación y su candidato sie
   assert.ok(start, 'falta el candidato del punto inicial');
   const dyaw = Math.abs(Math.atan2(Math.sin(start.yaw + 1.9), Math.cos(start.yaw + 1.9)));
   assert.ok(dyaw < 0.02 && Math.hypot(start.t[0] - 0.8, start.t[2] + 0.6) < 0.04, `candidato inicio: yaw ${start.yaw} t ${start.t}`);
+});
+
+test('suelo: una superficie a menos de 0.8 m bajo la cámara no se toma como suelo', () => {
+  // barrido que solo ve una "mesa" a 0.7 m y paredes, nunca el suelo real (y = 0)
+  const sess = new Fusion({ voxel: 0.05, minWeight: 1, ...IDEAL });
+  for (const yaw of [-0.4, 0, 0.4]) {
+    const M = pose(yaw, -0.6, 0, 1.25, 0);
+    const depth = roomDepth(M);
+    // superficie horizontal a y = 0.7 delante de la cámara
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const yc = (1 - 2 * ((j + 0.5) / H)) / PROJ[5];
+      const dy = M[1] * ((2 * ((i + 0.5) / W) - 1) / PROJ[0]) + M[5] * yc - M[9];
+      if (dy < -0.05) { const tt = (0.7 - 1.25) / dy; if (tt > 0 && tt * 1000 < depth[j * W + i]) depth[j * W + i] = Math.round(tt * 1000); }
+    }
+    sess.integrate(frameOf(depth, M));
+  }
+  const sc = sess.surfaceCloud();
+  assert.ok(Math.abs(estimateFloor(sc) - 0.7) < 0.08, 'la estimación ingenua toma la mesa como suelo');
+  const saved = new Fusion({ voxel: 0.03, ...IDEAL });
+  scanRoom(saved);
+  const r = relocalize(saved.surfaceCloud(), sc, {
+    refine: (init) => ({ yaw: init[0], t: [init[1], init[2], init[3]], matrix: yawMatrix(init[0], init[1], init[2], init[3]) }),
+    score: () => 0.5, sessionCamY: 1.25, sessionFloorFallback: 0, savedFloorFallback: 0,
+  });
+  assert.equal(r.sessionFloor, 0, `suelo de sesión ${r.sessionFloor}`);
 });
