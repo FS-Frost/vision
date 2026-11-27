@@ -661,7 +661,7 @@ function updateAnchorPanel() {
   const i = rl.anchorHits.length;
   const a = saved[i];
   ui.anchorPanel.hidden = false;
-  if (a?.photo) ui.anchorPhoto.src = a.photo;
+  if (a?.photo && ui.anchorPhoto.src !== a.photo) { ui.anchorPhoto.src = a.photo; ui.anchorPhoto.classList.remove('big'); }
   ui.anchorPhoto.hidden = !a?.photo;
   ui.anchorText.textContent = a
     ? `Ancla ${i + 1} de ${saved.length}: apunta la mirilla al punto marcado con la cruz en la foto y toca Marcar`
@@ -1203,6 +1203,9 @@ ui.stop.addEventListener('click', () => {
   renderer.xr.getSession()?.end();
 });
 ui.anchorBtn.addEventListener('click', markCaptureAnchor);
+// tocar la foto (ancla o inicio) la agranda / la devuelve a la esquina
+ui.anchorPhoto.addEventListener('click', () => ui.anchorPhoto.classList.toggle('big'));
+ui.startPhotoBox.addEventListener('click', () => ui.startPhotoBox.classList.toggle('big'));
 ui.anchorMark.addEventListener('click', markSessionAnchor);
 ui.anchorUse.addEventListener('click', () => { if (state.reloc?.phase === 'anchors' && state.reloc.anchorHits.length >= 2) solveFromAnchors(); });
 ui.anchorRedo.addEventListener('click', () => {
