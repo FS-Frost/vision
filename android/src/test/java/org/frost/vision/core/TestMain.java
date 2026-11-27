@@ -37,6 +37,8 @@ public final class TestMain {
     test("GLB: escribir y leer conserva vértices, colores e índices", TestMain::glb);
     test("JSON: parseo y escape", TestMain::json);
     test("metadatos y .html compartido: ida y vuelta", TestMain::metaShare);
+    test("simplificación: menos triángulos, misma superficie, sin degenerados", TestMain::simplify);
+    test("sugerencia de anclas: esquina buena, pared lisa no", TestMain::anchorHint);
     test("registro de frames: escribir y leer da la misma malla", TestMain::frameLog);
     System.out.println();
     System.out.println("pasaron " + passed + ", fallaron " + failed);
@@ -487,5 +489,41 @@ public final class TestMain {
     String html = ShareHtml.build("<title>{{TITLE}}</title><script id=\"glb\" type=\"application/octet-stream\">\n{{GLB}}\n</script>", bin, "a<b");
     check(html.contains("a&lt;b"), "escape");
     check(java.util.Arrays.equals(bin, ShareHtml.extractGlb(html)), "extraer glb");
+  }
+
+  static void simplify() {
+    Fusion f = new Fusion(new Params());
+    TestScene.scanRoom(f);
+    List<MeshPart> full = f.finalMeshes(80, 0.004).meshes;
+    int t0 = Simplify.triangles(full);
+    List<MeshPart> s = Simplify.cluster(full, 0.06f);
+    int t1 = Simplify.triangles(s);
+    check(t1 < t0 * 0.4 && t1 > t0 * 0.05, "triángulos " + t0 + " -> " + t1);
+    Cloud ref = Fusion.cloudFrom(full);
+    float worst = 0;
+    for (MeshPart m : s) {
+      for (int t = 0; t < m.indices.length; t += 3) check(m.indices[t] != m.indices[t + 1] && m.indices[t + 1] != m.indices[t + 2] && m.indices[t] != m.indices[t + 2], "degenerado");
+      for (int i = 0; i < m.vertexCount(); i += 7) {
+        int j = ref.nearest(0.1f, m.positions[i * 3], m.positions[i * 3 + 1], m.positions[i * 3 + 2]);
+        check(j >= 0, "vértice lejos de la superficie");
+        float dx = ref.pos[j * 3] - m.positions[i * 3], dy = ref.pos[j * 3 + 1] - m.positions[i * 3 + 1], dz = ref.pos[j * 3 + 2] - m.positions[i * 3 + 2];
+        worst = Math.max(worst, (float) Math.sqrt(dx * dx + dy * dy + dz * dz));
+      }
+    }
+    check(worst < 0.08f, "distancia máxima a la superficie " + worst);
+    List<MeshPart> b = Simplify.toBudget(full, 0.03f, t0 / 4);
+    check(Simplify.triangles(b) <= t0 / 4, "presupuesto " + Simplify.triangles(b));
+    System.out.printf("     simplificación: %d -> %d triángulos (celda 6 cm), error máx. %.1f cm%n", t0, t1, worst * 100);
+  }
+
+  static void anchorHint() {
+    // Esquina superior delantera izquierda de la caja (0.2, 0.6, -0.9), vista desde arriba y delante.
+    DepthFrame corner = TestScene.room(Mat4.pose(0, -Math.atan2(0.6, 1.2), 0.2, 1.2, 0.3));
+    float[] c = AnchorHint.score(corner, TestScene.W / 2f, TestScene.H / 2f, 4);
+    DepthFrame wall = TestScene.room(Mat4.pose(0, 0, 0, 1.3, -0.5));
+    float[] w = AnchorHint.score(wall, TestScene.W / 2f, TestScene.H / 2f, 4);
+    System.out.printf("     anclas: esquina residuo %.1f cm (nivel %.0f), pared %.2f cm (nivel %.0f)%n", c[1] * 100, c[0], w[1] * 100, w[0]);
+    check(c[0] == AnchorHint.GOOD, "la esquina debería ser buena");
+    check(w[0] == AnchorHint.FLAT, "la pared lisa no");
   }
 }

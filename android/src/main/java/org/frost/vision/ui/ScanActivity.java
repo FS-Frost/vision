@@ -41,6 +41,7 @@ import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationExceptio
 
 import org.frost.vision.ar.ArCapture;
 import org.frost.vision.ar.FusionWorker;
+import org.frost.vision.core.AnchorHint;
 import org.frost.vision.core.Cloud;
 import org.frost.vision.core.DepthFrame;
 import org.frost.vision.core.FrameLog;
@@ -55,6 +56,7 @@ import org.frost.vision.core.Volume;
 import org.frost.vision.gpu.BackgroundRenderer;
 import org.frost.vision.gpu.Gl;
 import org.frost.vision.gpu.MeshRenderer;
+import org.frost.vision.store.ScanSaver;
 import org.frost.vision.store.ScanStore;
 
 import java.io.File;
@@ -474,12 +476,12 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
 
   private void updateCrosshair(Frame frame) {
     DepthFrame df = lastFrame;
-    if (df == null) { crosshair = null; cross.ok = false; return; }
+    if (df == null) { crosshair = null; cross.level = 0; return; }
     float[] uv = ArCapture.viewToDepth(frame, 0.5f, 0.5f, df.width, df.height);
     float[] p = ArCapture.crosshair(df, uv[0], uv[1]);
     crosshair = p;
-    boolean ok = p != null;
-    if (ok != cross.ok) { cross.ok = ok; cross.postInvalidate(); }
+    int level = p == null ? AnchorHint.NONE : (int) AnchorHint.score(df, uv[0], uv[1], 4)[0];
+    if (level != cross.level) { cross.level = level; cross.postInvalidate(); }
     float f = arFloor();
     if (!Float.isNaN(f)) sessionFloor = f;
     if (phase == Phase.ANCHORS) runOnUiThread(this::refreshAnchorText);
@@ -945,55 +947,22 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     worker.run(() -> {
       try {
         worker.flushAll();
-        Fusion f = worker.fusion;
-        Fusion.Final fin = f.finalMeshes(80, 0.004);
-        if (fin.totalTris == 0) {
+        ScanSaver.Input in = new ScanSaver.Input();
+        in.parent = saved;
+        in.startPose = sessionStartPose;
+        in.startJpeg = startPhoto != null ? ScanStore.jpeg(startPhoto, 80) : null;
+        in.arFloor = floorNow;
+        synchronized (newAnchors) {
+          in.anchors = new ArrayList<>(newAnchors);
+          in.anchorJpegs = new ArrayList<>();
+          for (Bitmap b : newAnchorPhotos) in.anchorJpegs.add(b != null ? ScanStore.jpeg(b, 85) : null);
+        }
+        ScanMeta m = ScanSaver.save(store, worker.fusion, in);
+        if (m == null) {
           runOnUiThread(() -> { toast("No hay nada escaneado todavía."); phase = Phase.SCANNING; worker.setPaused(false); showScanningBar(); });
           return;
         }
-        ScanMeta m = new ScanMeta();
-        m.id = ScanStore.newId();
-        m.created = System.currentTimeMillis();
-        m.name = (saved != null ? saved.name + " (ampliado)" : ScanStore.defaultName(m.created));
-        m.voxel = f.params.voxel;
-        m.hasVolume = true;
-        m.parent = saved != null ? saved.id : null;
-        for (MeshPart p : fin.meshes) { m.verts += p.vertexCount(); m.tris += p.triangleCount(); }
-        // Suelo y pista de inicio en el marco del escaneo.
-        Cloud cloud = Fusion.cloudFrom(fin.meshes);
-        if (saved != null) {
-          m.startPose = saved.startPose;
-          m.floorY = saved.floorY;
-        } else {
-          m.startPose = sessionStartPose;
-          float fy = Reloc.estimateFloor(cloud, Float.isNaN(floorNow) ? null : floorNow);
-          if (sessionStartPose != null && sessionStartPose[13] - fy < Reloc.MIN_CAM_ABOVE_FLOOR && !Float.isNaN(floorNow)) fy = floorNow;
-          m.floorY = fy;
-        }
-        if (saved != null) m.anchors.addAll(saved.anchors);
-        List<ScanMeta.Anchor> mine;
-        List<Bitmap> photos;
-        synchronized (newAnchors) { mine = new ArrayList<>(newAnchors); photos = new ArrayList<>(newAnchorPhotos); }
-        for (int i = 0; i < mine.size(); i++) {
-          ScanMeta.Anchor a = mine.get(i);
-          a.photo = "anchor" + (m.anchors.size()) + ".jpg";
-          if (photos.get(i) != null) store.writeFile(m.id, a.photo, ScanStore.jpeg(photos.get(i), 85));
-          m.anchors.add(a);
-        }
-        if (saved != null) {
-          for (ScanMeta.Anchor a : saved.anchors) {
-            File src = store.file(saved.id, a.photo);
-            if (a.photo != null && src.isFile()) store.writeFile(m.id, a.photo, ScanStore.read(src));
-          }
-          File st = store.file(saved.id, "start.jpg");
-          if (st.isFile()) store.writeFile(m.id, "start.jpg", ScanStore.read(st));
-        } else if (startPhoto != null) {
-          store.writeFile(m.id, "start.jpg", ScanStore.jpeg(startPhoto, 80));
-        }
-        store.writeFile(m.id, "mesh.glb", Glb.write(fin.meshes, m.name));
-        store.writeFile(m.id, "volume.bin", f.volume.export());
-        store.writeMeta(m);
-        Log.i(TAG, "guardado " + m.id + ": " + m.tris + " triángulos, " + f.volume.size() + " bloques, quitados " + fin.removedTris);
+        Log.i(TAG, "guardado " + m.id + ": " + m.tris + " triángulos, " + worker.fusion.volume.size() + " bloques");
         runOnUiThread(() -> {
           startActivity(new Intent(this, ViewerActivity.class).putExtra("id", m.id));
           finish();
@@ -1029,9 +998,14 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     float[] p = crosshair;
     String distHint = null;
     if (ph == Phase.SCANNING && tracking && p != null && p[3] > 2.2f) distHint = "Acércate: la profundidad es más precisa a menos de 1,5 m.";
+    if (ph == Phase.SCANNING && tracking) {
+      int lv = cross.level;
+      text = text + (lv == AnchorHint.GOOD ? "\nmirilla: buen punto para ancla" : lv == AnchorHint.FLAT ? "\nmirilla: superficie lisa (mal ancla)" : "\nmirilla: sin profundidad");
+    }
     final String dh = distHint;
+    final String ft = text;
     runOnUiThread(() -> {
-      hud.setText(text);
+      hud.setText(ft);
       if (dh != null && newAnchors.isEmpty() && continueId == null && playback == null) hint.setText(dh);
     });
   }

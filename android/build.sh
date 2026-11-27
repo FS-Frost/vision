@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Construye el APK sin Gradle ni IDE: solo herramientas del Android SDK + ARCore vendorizado.
+# APK de depuracion (android:debuggable por --debug-mode): permite run-as para sacar escaneos y grabaciones.
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./env.sh
@@ -30,6 +31,7 @@ echo "[2/8] aapt2 link     - recursos + manifest (R de la app y de com.google.ar
   --manifest src/main/AndroidManifest.xml \
   --java "$OUT/gen" \
   --extra-packages com.google.ar.core \
+  --debug-mode \
   --min-sdk-version "$MIN_SDK" \
   --target-sdk-version "$TARGET_SDK" \
   --version-code "$VERSION_CODE" \

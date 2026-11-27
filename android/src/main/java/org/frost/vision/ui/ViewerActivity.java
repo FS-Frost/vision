@@ -263,7 +263,32 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
     return s.isEmpty() ? "escaneo" : s;
   }
 
+  static final int BIG_TRIS = 150_000;
+  private volatile boolean simplified;
+
+  /** Mallas grandes: preguntar si se exporta completa o simplificada (luego ejecuta next). */
+  private void chooseDetail(Runnable next) {
+    if (meta.tris <= BIG_TRIS) { simplified = false; next.run(); return; }
+    new AlertDialog.Builder(this).setTitle("Malla grande (" + String.format(java.util.Locale.US, "%,d", meta.tris).replace(',', '.') + " triángulos)")
+        .setMessage("La versión simplificada pesa menos y se abre mejor en otros dispositivos.")
+        .setPositiveButton("Simplificada", (d, w) -> { simplified = true; next.run(); })
+        .setNegativeButton("Completa", (d, w) -> { simplified = false; next.run(); })
+        .show();
+  }
+
+  /** El .glb a exportar: el guardado, o simplificado (Simplify.toBudget) si se eligió. */
+  private byte[] glbBytes() throws java.io.IOException {
+    byte[] glb = ScanStore.read(store.file(meta.id, "mesh.glb"));
+    if (!simplified) return glb;
+    List<MeshPart> parts = org.frost.vision.core.Simplify.toBudget(org.frost.vision.core.Glb.read(glb), meta.voxel, BIG_TRIS);
+    return org.frost.vision.core.Glb.write(parts, meta.name);
+  }
+
   private void exportGlb() {
+    chooseDetail(this::exportGlbNow);
+  }
+
+  private void exportGlbNow() {
     Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
     i.addCategory(Intent.CATEGORY_OPENABLE);
     i.setType("model/gltf-binary");
@@ -279,7 +304,7 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
     new Thread(() -> {
       String msg;
       try (OutputStream out = getContentResolver().openOutputStream(uri)) {
-        out.write(ScanStore.read(store.file(meta.id, "mesh.glb")));
+        out.write(glbBytes());
         msg = "Exportado .glb";
       } catch (Exception e) {
         msg = "No se pudo exportar: " + e.getMessage();
@@ -290,9 +315,13 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
   }
 
   private void shareHtml() {
+    chooseDetail(this::shareHtmlNow);
+  }
+
+  private void shareHtmlNow() {
     new Thread(() -> {
       try {
-        byte[] glb = ScanStore.read(store.file(meta.id, "mesh.glb"));
+        byte[] glb = glbBytes();
         String html = ShareHtml.build(Gl.asset(getAssets(), "share/viewer.html"), glb, meta.name);
         Uri uri = ShareProvider.publish(this, fileBase() + ".html", html.getBytes("UTF-8"));
         Intent send = new Intent(Intent.ACTION_SEND);

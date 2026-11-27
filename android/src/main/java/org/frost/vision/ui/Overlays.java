@@ -10,9 +10,10 @@ import android.view.View;
 final class Overlays {
   private Overlays() {}
 
-  /** Mirilla en el centro de la vista; verde si hay profundidad fiable en el centro. */
+  /** Mirilla en el centro de la vista: blanca sin profundidad fiable, amarilla en superficie lisa, verde en buen punto para ancla. */
   static final class Crosshair extends View {
-    volatile boolean ok;
+    /** Nivel de org.frost.vision.core.AnchorHint (0 sin dato, 1 liso, 2 bueno). */
+    volatile int level;
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     Crosshair(Context c) {
@@ -27,7 +28,7 @@ final class Overlays {
       p.setColor(0x99000000);
       p.setStrokeWidth(Ui.dp(getContext(), 4));
       draw(c, cx, cy, r);
-      p.setColor(ok ? 0xFF3FB950 : 0xFFFFFFFF);
+      p.setColor(level == 2 ? 0xFF3FB950 : level == 1 ? 0xFFF2CC3C : 0xFFFFFFFF);
       p.setStrokeWidth(Ui.dp(getContext(), 2));
       draw(c, cx, cy, r);
     }

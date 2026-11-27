@@ -17,6 +17,10 @@ import org.frost.vision.core.TestScene;
 import org.frost.vision.core.Volume;
 import org.frost.vision.gpu.EglThread;
 import org.frost.vision.gpu.GpuFusion;
+import org.frost.vision.core.Reloc;
+import org.frost.vision.core.ScanMeta;
+import org.frost.vision.core.Simplify;
+import org.frost.vision.store.ScanSaver;
 import org.frost.vision.store.ScanStore;
 
 import java.io.File;
@@ -76,7 +80,12 @@ public final class TestsActivity extends Activity {
         synth.add(f);
       }
     }
-    compare("sintética", synth, new Params());
+    Fusion gf = compare("sintética", synth, new Params());
+    try {
+      saveAndReload(gf);
+    } catch (Exception e) {
+      print("{\"test\":\"guardar\",\"pass\":false,\"error\":\"" + e + "\"}");
+    }
     File[] logs = new ScanStore(this).recordingFiles(".frames");
     if (logs.length == 0) {
       print("{\"test\":\"grabación\",\"skip\":\"no hay grabaciones .frames (Grabar en Nuevo escaneo)\"}");
@@ -94,7 +103,52 @@ public final class TestsActivity extends Activity {
     print("FIN");
   }
 
-  private void compare(String name, List<DepthFrame> frames, Params params) {
+  /** Guarda con el mismo camino que la app, relee de disco y simula una continuación con anclas. */
+  private void saveAndReload(Fusion gf) throws Exception {
+    ScanStore store = new ScanStore(this);
+    ScanSaver.Input in = new ScanSaver.Input();
+    in.name = "Escena de prueba (sintética)";
+    in.startPose = Mat4.pose(-1.4, -0.5, 0, 1.3, 0);
+    in.arFloor = 0;
+    in.anchors = new ArrayList<>();
+    float[][] pts = {{0.2f, 0.6f, -0.9f}, {0.7f, 0.6f, -0.9f}, {0.7f, 0.6f, -1.4f}};
+    for (float[] q : pts) {
+      ScanMeta.Anchor a = new ScanMeta.Anchor();
+      a.p = q; a.cam = new float[] {0, 1.3f, 0}; a.camHeight = 1.3f;
+      a.dist = (float) Math.sqrt(q[0] * q[0] + (q[1] - 1.3f) * (q[1] - 1.3f) + q[2] * q[2]);
+      in.anchors.add(a);
+    }
+    long t0 = System.nanoTime();
+    ScanMeta m = ScanSaver.save(store, gf, in);
+    double saveMs = (System.nanoTime() - t0) / 1e6;
+    List<MeshPart> mesh = store.meshes(m.id);
+    int tris = 0;
+    for (MeshPart pm : mesh) tris += pm.triangleCount();
+    Fusion re = new Fusion(Params.withVoxel(m.voxel));
+    re.setVolume(store.volume(m.id, re.params, true));
+    int reVerts = 0, gfVerts = 0;
+    for (MeshPart pm : re.allMeshes()) reVerts += pm.vertexCount();
+    for (MeshPart pm : gf.allMeshes()) gfVerts += pm.vertexCount();
+    ScanMeta back = store.meta(m.id);
+    // Continuación: la sesión está girada 0,7 rad y desplazada; las anclas recuperan la pose.
+    float[] A = Mat4.yaw(0.7, 0.3, 0, -0.2), Ainv = Mat4.invertRigid(A);
+    List<float[]> sv = new ArrayList<>(), ss = new ArrayList<>();
+    for (ScanMeta.Anchor a : back.anchors) {
+      float[] q = new float[3];
+      Mat4.transform(Ainv, a.p[0], a.p[1], a.p[2], q);
+      sv.add(a.p); ss.add(q);
+    }
+    Reloc.AnchorSolution sol = Reloc.solveAnchors(sv, ss);
+    boolean anchorsOk = Math.abs(Mat4.angleDiff(sol.yaw, 0.7)) < 1e-3 && sol.maxResidual < 1e-3;
+    int simp = Simplify.triangles(Simplify.toBudget(mesh, m.voxel, tris / 3));
+    boolean pass = tris == m.tris && back.anchors.size() == 3 && Math.abs(back.floorY) < 0.05f
+        && Math.abs(reVerts - gfVerts) <= gfVerts * 0.01 && anchorsOk && simp <= tris / 3;
+    print(String.format(Locale.US, "{\"test\":\"guardar, releer y continuar\",\"pass\":%b,\"id\":\"%s\",\"tris\":%d,\"saveMs\":%.0f,"
+        + "\"floorY\":%.3f,\"reloadVerts\":%d,\"gpuVerts\":%d,\"anchorYaw\":%.4f,\"anchorResidual\":%.5f,\"simplifiedTris\":%d}",
+        pass, m.id, tris, saveMs, back.floorY, reVerts, gfVerts, sol.yaw, sol.maxResidual, simp));
+  }
+
+  private Fusion compare(String name, List<DepthFrame> frames, Params params) {
     Fusion gf = new Fusion(params), cf = new Fusion(params);
     GpuFusion gpu = new GpuFusion(getAssets(), gf, 2048);
     double gpuMs = 0, gpuMax = 0, cpuMs = 0, syncMs = 0, prepMs = 0;
@@ -167,6 +221,7 @@ public final class TestsActivity extends Activity {
     print(String.format(Locale.US, "{\"test\":\"%s tiempos\",\"medianMs\":%.2f,\"p90Ms\":%.2f,\"touchMedianMs\":%.2f,\"slotsMedianMs\":%.2f}",
         name, pct(tot, 0.5), pct(tot, 0.9), pct(touch, 0.5), pct(slots, 0.5)));
     gpu.release();
+    return gf;
   }
 
   private static double pct(double[] a, double q) {
