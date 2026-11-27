@@ -41,6 +41,7 @@ public final class TestMain {
     test("sugerencia de anclas: esquina buena, pared lisa no", TestMain::anchorHint);
     test("GLB de la web (GLTFExporter de three.js): jerarquía de nodos", TestMain::webGlb);
     test("texturas: cada triángulo toma su color de la foto correcta; GLB con imágenes", TestMain::textures);
+    test("mallado en paralelo: misma malla que en serie", TestMain::parallelMesh);
     test("registro de frames: escribir y leer da la misma malla", TestMain::frameLog);
     System.out.println();
     System.out.println("pasaron " + passed + ", fallaron " + failed);
@@ -605,5 +606,24 @@ public final class TestMain {
       check(back.get(i).image == tex.get(i).image, "imagen de la parte " + i);
       if (tex.get(i).textured()) check(java.util.Arrays.equals(back.get(i).uvs, tex.get(i).uvs), "uvs");
     }
+  }
+
+  static void parallelMesh() {
+    Fusion a = new Fusion(new Params()), b = new Fusion(new Params());
+    b.setMeshThreads(4);
+    TestScene.scanRoom(a);
+    TestScene.scanRoom(b);
+    long t0 = System.nanoTime();
+    a.allMeshes();
+    long t1 = System.nanoTime();
+    b.allMeshes();
+    long t2 = System.nanoTime();
+    b.release();
+    check(a.blockMeshes.size() == b.blockMeshes.size(), "bloques");
+    for (Map.Entry<Long, MeshPart> e : a.blockMeshes.entrySet()) {
+      MeshPart x = e.getValue(), y = b.blockMeshes.get(e.getKey());
+      check(y != null && java.util.Arrays.equals(x.positions, y.positions) && java.util.Arrays.equals(x.indices, y.indices), "bloque distinto");
+    }
+    System.out.printf("     mallado: serie %.0f ms, 4 hilos %.0f ms%n", (t1 - t0) / 1e6, (t2 - t1) / 1e6);
   }
 }

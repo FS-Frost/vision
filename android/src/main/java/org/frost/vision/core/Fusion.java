@@ -21,7 +21,15 @@ public final class Fusion {
   public final Params params;
   public Volume volume;
   private final SurfaceNets nets = new SurfaceNets();
-  private final LinkedHashSet<Long> pending = new LinkedHashSet<>();
+  /** Cola de mallado: lo más reciente delante (lo que el usuario está mirando se malla primero). */
+  private final java.util.ArrayDeque<Long> pending = new java.util.ArrayDeque<>();
+  private final HashSet<Long> pendingSet = new HashSet<>();
+  /** Mallado en paralelo (opcional): SurfaceNets tiene búferes propios, uno por hilo. */
+  private java.util.concurrent.ExecutorService pool;
+  private int poolThreads;
+  private final ThreadLocal<SurfaceNets> threadNets = new ThreadLocal<SurfaceNets>() {
+    @Override protected SurfaceNets initialValue() { return new SurfaceNets(); }
+  };
   public final HashMap<Long, MeshPart> blockMeshes = new HashMap<>();
   private Cloud target;
   /** Transformación sesión -> escaneo guardado (continuar); null = identidad. */
@@ -35,6 +43,7 @@ public final class Fusion {
   public void setVolume(Volume v) {
     volume = v;
     pending.clear();
+    pendingSet.clear();
     blockMeshes.clear();
     target = null;
   }
@@ -53,8 +62,20 @@ public final class Fusion {
 
   private void collectDirty() {
     if (volume.dirty.isEmpty()) return;
-    for (long k : volume.dirty) pending.addAll(volume.neighborhood(k));
+    for (long k : volume.dirty) for (long n : volume.neighborhood(k)) if (pendingSet.add(n)) pending.addFirst(n);
     volume.dirty.clear();
+  }
+
+  /** Mallar con n hilos (n <= 1: en el hilo que llama). El volumen no debe cambiar durante extract. */
+  public void setMeshThreads(int n) {
+    if (pool != null) pool.shutdown();
+    poolThreads = n;
+    pool = n > 1 ? java.util.concurrent.Executors.newFixedThreadPool(n) : null;
+  }
+
+  public void release() {
+    if (pool != null) pool.shutdownNow();
+    pool = null;
   }
 
   public static long superOf(long blockKey) {
@@ -66,14 +87,40 @@ public final class Fusion {
     collectDirty();
     long t0 = System.nanoTime();
     HashSet<Long> supers = new HashSet<>();
-    Iterator<Long> it = pending.iterator();
-    while (it.hasNext()) {
-      long key = it.next();
-      it.remove();
-      MeshPart m = nets.mesh(volume, key);
-      if (m != null) blockMeshes.put(key, m); else blockMeshes.remove(key);
-      supers.add(superOf(key));
-      if ((System.nanoTime() - t0) / 1e6 > budgetMs) break;
+    if (pool == null) {
+      while (!pending.isEmpty()) {
+        long key = pending.pollFirst();
+        pendingSet.remove(key);
+        MeshPart m = nets.mesh(volume, key);
+        if (m != null) blockMeshes.put(key, m); else blockMeshes.remove(key);
+        supers.add(superOf(key));
+        if ((System.nanoTime() - t0) / 1e6 > budgetMs) break;
+      }
+    } else {
+      while (!pending.isEmpty() && (System.nanoTime() - t0) / 1e6 <= budgetMs) {
+        int n = Math.min(pending.size(), poolThreads * 16);
+        final long[] keys = new long[n];
+        for (int i = 0; i < n; i++) { keys[i] = pending.pollFirst(); pendingSet.remove(keys[i]); }
+        final MeshPart[] res = new MeshPart[n];
+        List<java.util.concurrent.Callable<Void>> tasks = new ArrayList<>();
+        for (int tdx = 0; tdx < poolThreads; tdx++) {
+          final int t = tdx;
+          tasks.add(() -> {
+            SurfaceNets sn = threadNets.get();
+            for (int i = t; i < n; i += poolThreads) res[i] = sn.mesh(volume, keys[i]);
+            return null;
+          });
+        }
+        try {
+          for (java.util.concurrent.Future<Void> fu : pool.invokeAll(tasks)) fu.get();
+        } catch (Exception e) {
+          throw new RuntimeException("mallado en paralelo", e);
+        }
+        for (int i = 0; i < n; i++) {
+          if (res[i] != null) blockMeshes.put(keys[i], res[i]); else blockMeshes.remove(keys[i]);
+          supers.add(superOf(keys[i]));
+        }
+      }
     }
     List<MeshPart> out = new ArrayList<>();
     for (long sk : supers) out.add(mergeSuper(sk, blockMeshes));

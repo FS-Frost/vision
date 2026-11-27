@@ -51,6 +51,8 @@ public final class FusionWorker {
 
   public FusionWorker(AssetManager am, Params params, boolean allowGpu, Listener listener) {
     this.fusion = new Fusion(params);
+    // Mallado en paralelo: el g54 tiene 8 núcleos (2 grandes + 6 pequeños); el hilo de fusión espera.
+    fusion.setMeshThreads(Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 2)));
     this.listener = listener;
     thread = new EglThread("fusion").begin();
     final boolean[] done = {false};
@@ -99,6 +101,7 @@ public final class FusionWorker {
   /** Entrega un frame. Devuelve false si se descartó porque el hilo estaba ocupado. */
   public boolean submit(DepthFrame f) {
     latest = f;
+    lastFrameMs = System.currentTimeMillis();
     if (busy || paused) return false;
     busy = true;
     thread.post(() -> {
@@ -126,12 +129,26 @@ public final class FusionWorker {
       try { FrameLog.write(log, f); } catch (IOException e) { Log.e(Gl.TAG, "registro de frames", e); log = null; }
     }
     long now = System.currentTimeMillis();
-    if (now - lastSync > 250) flush(6);
+    if (now - lastSync > 150) flush(20);
   }
 
+  private volatile long lastFrameMs;
+  private volatile boolean draining;
+
+  /**
+   * Cada 200 ms: con frames llegando, un tramo corto (no robar tiempo a la integración); parado
+   * (> 150 ms sin frames), se malla sin pausa en tramos de 40 ms hasta vaciar la cola
+   * (criterio F1: 0 bloques pendientes 1 s después de dejar de moverse).
+   */
   private void tick() {
     if (gpu != null && gpu.gpuDirtyCount() == 0 && fusion.pendingCount() == 0) return;
-    flush(12);
+    if (gpu == null && fusion.pendingCount() == 0) return;
+    boolean idle = System.currentTimeMillis() - lastFrameMs > 150;
+    flush(idle ? 40 : 20);
+    if (idle && fusion.pendingCount() > 0 && !draining) {
+      draining = true;
+      thread.post(() -> { draining = false; tick(); });
+    }
   }
 
   /** Sincroniza GPU -> espejo y malla con presupuesto (ms). */
@@ -174,6 +191,7 @@ public final class FusionWorker {
       }
       if (gpu != null) gpu.release();
       gpu = null;
+      fusion.release();
     });
     thread.quit();
   }

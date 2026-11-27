@@ -81,6 +81,12 @@
         android:exported="true"
         android:screenOrientation="portrait" />
 
+    <!-- Simulación del escaneo en vivo con la escena sintética: adb shell am start -n org.frost.vision/.ui.SimActivity -->
+    <activity
+        android:name=".ui.SimActivity"
+        android:exported="true"
+        android:screenOrientation="portrait" />
+
     <provider
         android:name=".store.ShareProvider"
         android:authorities="org.frost.vision.share"
