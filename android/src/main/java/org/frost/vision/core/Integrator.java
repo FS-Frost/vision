@@ -1,7 +1,6 @@
 package org.frost.vision.core;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 
 /**
@@ -21,26 +20,36 @@ public final class Integrator {
    */
   public static List<Long> touchedBlocks(DepthFrame f, Params p, int stride) {
     boolean[] valid = f.validMask(p.edgeJump);
-    HashSet<Long> keys = new HashSet<>();
+    LongSet keys = new LongSet(1024);
     float inv = 1f / p.voxel;
     int k = (int) Math.ceil(p.trunc / p.voxel);
-    float[] pt = new float[3];
+    float[] m = f.pose;
+    float ox = m[12], oy = m[13], oz = m[14];
     for (int j = stride / 2; j < f.height; j += stride) {
+      float yc = (float) (-(j + 0.5 - f.cy) / f.fy);
       for (int i = stride / 2; i < f.width; i += stride) {
         int id = j * f.width + i;
         if (!valid[id]) continue;
         float d = f.depth[id];
         if (d < p.minDepth || d >= p.maxDepth || f.conf(id) < p.minConfidence) continue;
+        // dirección del rayo en el mundo para profundidad 1 (cámara: x, y, -1)
+        float xc = (float) ((i + 0.5 - f.cx) / f.fx);
+        float dx = m[0] * xc + m[4] * yc - m[8], dy = m[1] * xc + m[5] * yc - m[9], dz = m[2] * xc + m[6] * yc - m[10];
+        long last = Long.MIN_VALUE;
         for (int n = -k; n <= k; n++) {
           float dd = d + n * p.voxel;
           if (dd <= 0) continue;
-          f.unproject(i + 0.5, j + 0.5, dd, pt);
-          int ix = (int) Math.floor(pt[0] * inv), iy = (int) Math.floor(pt[1] * inv), iz = (int) Math.floor(pt[2] * inv);
-          keys.add(Volume.key(ix >> 3, iy >> 3, iz >> 3));
+          int ix = (int) Math.floor((ox + dx * dd) * inv), iy = (int) Math.floor((oy + dy * dd) * inv), iz = (int) Math.floor((oz + dz * dd) * inv);
+          long key = Volume.key(ix >> 3, iy >> 3, iz >> 3);
+          if (key != last) { keys.add(key); last = key; }
         }
       }
     }
-    return new ArrayList<>(keys);
+    long[] arr = keys.toArray();
+    java.util.Arrays.sort(arr); // orden determinista (no depende de la tabla hash)
+    List<Long> out = new ArrayList<>(arr.length);
+    for (long v : arr) out.add(v);
+    return out;
   }
 
   /** Integra un frame en los bloques indicados (los crea si no existen). Marca sucios los modificados. */

@@ -59,6 +59,7 @@ public final class HomeActivity extends Activity {
     root.addView(Ui.label(this, "Escaneos guardados", 16, Ui.TEXT, true), Ui.margins(this, 0, 0, 0, 8));
     list = Ui.column(this);
     root.addView(list);
+    Ui.insets(scroll, 0);
     setContentView(scroll);
     handleIncoming(getIntent());
   }

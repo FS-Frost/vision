@@ -153,9 +153,12 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     gl.setRenderer(this);
     gl.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
     root.addView(gl);
+    FrameLayout overlay = new FrameLayout(this);
+    root.addView(overlay);
+    Ui.insets(overlay, 0);
 
     cross = new Overlays.Crosshair(this);
-    root.addView(cross, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    root.addView(cross, 1, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
     int m = Ui.dp(this, 10);
     LinearLayout top = Ui.panel(this);
@@ -167,14 +170,14 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     hud.setTypeface(android.graphics.Typeface.MONOSPACE);
     top.addView(hud);
     FrameLayout.LayoutParams tlp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP);
-    tlp.setMargins(m, m + Ui.dp(this, 22), m, 0);
-    root.addView(top, tlp);
+    tlp.setMargins(m, m, m, 0);
+    overlay.addView(top, tlp);
 
     coverage = new Overlays.Coverage(this);
     int cs = Ui.dp(this, 84);
     FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(cs, cs, Gravity.END | Gravity.CENTER_VERTICAL);
     clp.setMargins(0, 0, m, 0);
-    root.addView(coverage, clp);
+    overlay.addView(coverage, clp);
 
     anchorPanel = Ui.panel(this);
     anchorPhoto = new ImageView(this);
@@ -185,12 +188,12 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     anchorPanel.setVisibility(View.GONE);
     FrameLayout.LayoutParams alp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.START | Gravity.CENTER_VERTICAL);
     alp.setMargins(m, Ui.dp(this, 40), 0, 0);
-    root.addView(anchorPanel, alp);
+    overlay.addView(anchorPanel, alp);
 
     bar = Ui.column(this);
     FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
-    blp.setMargins(m, 0, m, m + Ui.dp(this, 16));
-    root.addView(bar, blp);
+    blp.setMargins(m, 0, m, m);
+    overlay.addView(bar, blp);
     setContentView(root);
 
     Params params = new Params();

@@ -77,6 +77,9 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
     gl.setRenderer(this);
     gl.setOnTouchListener((v, e) -> { touch(e); return true; });
     root.addView(gl);
+    FrameLayout overlay = new FrameLayout(this);
+    root.addView(overlay);
+    Ui.insets(overlay, 0);
 
     LinearLayout top = Ui.panel(this);
     top.addView(Ui.label(this, meta.name, 16, Ui.TEXT, true));
@@ -84,8 +87,8 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
     top.addView(info);
     FrameLayout.LayoutParams tlp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP);
     int m = Ui.dp(this, 12);
-    tlp.setMargins(m, m + Ui.dp(this, 20), m, 0);
-    root.addView(top, tlp);
+    tlp.setMargins(m, m, m, 0);
+    overlay.addView(top, tlp);
 
     LinearLayout bottom = Ui.panel(this);
     walkBtn = Ui.button(this, "Caminar", Ui.BTN, v -> toggleWalk());
@@ -102,15 +105,15 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
         Ui.button(this, "Renombrar", Ui.BTN, v -> rename()),
         Ui.button(this, "Borrar", Ui.DANGER, v -> delete())), Ui.margins(this, 0, 8, 0, 0));
     FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
-    blp.setMargins(m, 0, m, m + Ui.dp(this, 16));
-    root.addView(bottom, blp);
+    blp.setMargins(m, 0, m, m);
+    overlay.addView(bottom, blp);
 
     joy = new JoystickView(this);
     int js = Ui.dp(this, 130);
     FrameLayout.LayoutParams jlp = new FrameLayout.LayoutParams(js, js, Gravity.BOTTOM | Gravity.START);
     jlp.setMargins(m, 0, 0, Ui.dp(this, 250));
     joy.setVisibility(android.view.View.GONE);
-    root.addView(joy, jlp);
+    overlay.addView(joy, jlp);
     setContentView(root);
     load();
   }

@@ -35,6 +35,7 @@ public final class DiagActivity extends Activity {
     int p = Ui.dp(this, 14);
     out.setPadding(p, Ui.dp(this, 36), p, p);
     sv.addView(out);
+    Ui.insets(sv, 0);
     setContentView(sv);
     print("Dispositivo: " + Build.MANUFACTURER + " " + Build.MODEL + " · Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
     print("ABI: " + android.text.TextUtils.join(", ", Build.SUPPORTED_ABIS));

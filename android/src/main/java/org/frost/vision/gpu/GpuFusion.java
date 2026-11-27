@@ -45,13 +45,15 @@ public final class GpuFusion {
   private int texDepth, texConf, texColor, texW, texH, colW, colH;
   private FloatBuffer depthUp, confUp;
   private ByteBuffer colorUp;
+  private float[] depthArr, onesArr;
+  private byte[] rgbaArr;
   private final LinkedHashSet<Long> gpuDirty = new LinkedHashSet<>();
   private final List<Volume.Block> slotted = new ArrayList<>();
   private final int uInv, uK, uCK, uSize, uColorSize, uHasColor, uP, uP2, uDepth, uConf, uColor;
   /** Bloques que no cupieron en el pool (diagnóstico). */
   public int dropped;
   /** Tiempos del último frame (ms): preparación en CPU, envío a GPU. */
-  public double lastCpuMs, lastGpuMs;
+  public double lastCpuMs, lastGpuMs, lastTouchMs, lastSlotsMs;
 
   public static boolean supported(int gles) { return gles >= 31; }
 
@@ -79,6 +81,19 @@ public final class GpuFusion {
     Gl.check("GpuFusion init");
     // Si el espejo ya tiene bloques (escaneo continuado) se suben al tocarlos por primera vez.
     for (Volume.Block b : fusion.volume.blocks.values()) b.slot = -1;
+  }
+
+  private final ByteBuffer[] scratch = new ByteBuffer[4];
+
+  /** Buffer directo reutilizable (allocateDirect por frame es caro en Android). */
+  private ByteBuffer scratch(int i, int bytes) {
+    ByteBuffer b = scratch[i];
+    if (b == null || b.capacity() < bytes) {
+      b = Gl.bytes(Math.max(bytes, b == null ? 1 << 16 : b.capacity() * 2));
+      scratch[i] = b;
+    }
+    b.clear();
+    return b;
   }
 
   private static int loc(int prog, String name) { return GLES20.glGetUniformLocation(prog, name); }
@@ -140,9 +155,9 @@ public final class GpuFusion {
         Log.w(Gl.TAG, "GpuFusion: pool lleno, se descartan " + (fresh.size() - room) + " bloques");
       }
       int first = used;
-      FloatBuffer tf = Gl.bytes(room * BLOCK_BYTES).asFloatBuffer();
-      FloatBuffer wf = Gl.bytes(room * BLOCK_BYTES).asFloatBuffer();
-      IntBuffer cf = Gl.bytes(room * BLOCK_BYTES).asIntBuffer();
+      FloatBuffer tf = scratch(0, room * BLOCK_BYTES).asFloatBuffer();
+      FloatBuffer wf = scratch(1, room * BLOCK_BYTES).asFloatBuffer();
+      IntBuffer cf = scratch(2, room * BLOCK_BYTES).asIntBuffer();
       for (int i = 0; i < room; i++) {
         Volume.Block b = fresh.get(i);
         b.slot = used++;
@@ -177,11 +192,11 @@ public final class GpuFusion {
     }
     boolean[] valid = f.validMask(p.edgeJump);
     int n = texW * texH;
+    if (depthArr == null || depthArr.length != n) { depthArr = new float[n]; onesArr = new float[n]; java.util.Arrays.fill(onesArr, 1f); }
+    for (int i = 0; i < n; i++) depthArr[i] = valid[i] ? f.depth[i] : 0f;
     depthUp.position(0); confUp.position(0);
-    for (int i = 0; i < n; i++) {
-      depthUp.put(valid[i] ? f.depth[i] : 0f);
-      confUp.put(f.conf(i));
-    }
+    depthUp.put(depthArr);
+    confUp.put(f.confidence != null ? f.confidence : onesArr);
     depthUp.position(0); confUp.position(0);
     GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1);
     GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texDepth);
@@ -196,10 +211,13 @@ public final class GpuFusion {
         colorUp = Gl.bytes(colW * colH * 4);
       }
       byte[] rgb = f.color;
-      colorUp.position(0);
-      for (int i = 0, m = colW * colH; i < m; i++) {
-        colorUp.put(rgb[i * 3]); colorUp.put(rgb[i * 3 + 1]); colorUp.put(rgb[i * 3 + 2]); colorUp.put((byte) -1);
+      int m = colW * colH;
+      if (rgbaArr == null || rgbaArr.length != m * 4) rgbaArr = new byte[m * 4];
+      for (int i = 0, o = 0; i < m; i++, o += 4) {
+        rgbaArr[o] = rgb[i * 3]; rgbaArr[o + 1] = rgb[i * 3 + 1]; rgbaArr[o + 2] = rgb[i * 3 + 2]; rgbaArr[o + 3] = (byte) -1;
       }
+      colorUp.position(0);
+      colorUp.put(rgbaArr);
       colorUp.position(0);
       GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texColor);
       GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, colW, colH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, colorUp);
@@ -212,7 +230,11 @@ public final class GpuFusion {
     Params p = fusion.params;
     DepthFrame f = fusion.aligned(frame);
     List<Long> keys = Integrator.touchedBlocks(f, p, 2);
+    long tk = System.nanoTime();
     List<Volume.Block> blocks = slots(keys);
+    long ts = System.nanoTime();
+    lastTouchMs = (tk - t0) / 1e6;
+    lastSlotsMs = (ts - tk) / 1e6;
     int n = blocks.size();
     if (n == 0) return 0;
     if (n > activeCap) {
@@ -220,7 +242,7 @@ public final class GpuFusion {
       while (activeCap < n) activeCap *= 2;
       activeBuf = alloc(activeCap * 16);
     }
-    IntBuffer act = Gl.bytes(n * 16).asIntBuffer();
+    IntBuffer act = scratch(3, n * 16).asIntBuffer();
     for (Volume.Block b : blocks) {
       act.put(b.bx).put(b.by).put(b.bz).put(b.slot);
       gpuDirty.add(b.key);
@@ -284,7 +306,7 @@ public final class GpuFusion {
       }
       int n = batch.size();
       if (n == 0) continue;
-      IntBuffer sl = Gl.bytes(n * 4).asIntBuffer();
+      IntBuffer sl = scratch(3, n * 4).asIntBuffer();
       for (Volume.Block b : batch) sl.put(b.slot);
       sl.position(0);
       GLES20.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, slotsBuf);

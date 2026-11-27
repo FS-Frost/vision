@@ -223,7 +223,13 @@ public final class Fusion {
     }
     float[] pos = new float[acc.size() * 3], nor = new float[acc.size() * 3];
     int k = 0;
-    for (float[] a : acc.values()) {
+    // Orden por celda: el resultado (ICP, puntuaciones) no depende del orden de la tabla hash.
+    long[] keys = new long[acc.size()];
+    int nk = 0;
+    for (long key : acc.keySet()) keys[nk++] = key;
+    java.util.Arrays.sort(keys);
+    for (long key : keys) {
+      float[] a = acc.get(key);
       float len = (float) Math.sqrt(a[3] * a[3] + a[4] * a[4] + a[5] * a[5]);
       if (len < 0.5f * a[6]) continue;
       pos[k * 3] = a[0] / a[6]; pos[k * 3 + 1] = a[1] / a[6]; pos[k * 3 + 2] = a[2] / a[6];

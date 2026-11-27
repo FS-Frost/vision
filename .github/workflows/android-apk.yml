@@ -1,0 +1,59 @@
+name: APK Android
+
+# Solo etiquetas android-v*. Los commits sueltos no disparan nada: el APK de CI
+# es un entregable, no una comprobación de cada push (igual que linker).
+on:
+  push:
+    tags:
+      - 'android-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      # Historia completa y etiquetas: env.sh saca de ahí versionCode (número de
+      # commits) y versionName (la etiqueta).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Componentes del SDK
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Tests JVM de core/
+        run: bash test.sh
+
+      # build.sh descarga ARCore (verificando el SHA-256) a third_party/, que no se versiona.
+      - name: Construir
+        run: bash build.sh
+
+      - name: Verificar la firma
+        run: |
+          source ./env.sh
+          "$JAVA" -cp "$APKSIGNER_JAR" com.android.apksigner.ApkSignerTool verify \
+            --verbose --min-sdk-version "$MIN_SDK" build/vision-debug.apk
+
+      # Firmado con la keystore de depuración del repo: se instala encima de un
+      # build local, pero no es para publicar.
+      - name: Publicar el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vision-${{ github.ref_name }}
+          path: android/build/vision-debug.apk
+          if-no-files-found: error

@@ -48,6 +48,7 @@ public final class TestsActivity extends Activity {
     int p = Ui.dp(this, 14);
     out.setPadding(p, Ui.dp(this, 36), p, p);
     sv.addView(out);
+    Ui.insets(sv, 0);
     setContentView(sv);
     thread = new EglThread("pruebas").begin();
     thread.post(this::runAll);
@@ -97,6 +98,8 @@ public final class TestsActivity extends Activity {
     Fusion gf = new Fusion(params), cf = new Fusion(params);
     GpuFusion gpu = new GpuFusion(getAssets(), gf, 2048);
     double gpuMs = 0, gpuMax = 0, cpuMs = 0, syncMs = 0, prepMs = 0;
+    double[] tot = new double[frames.size()], touch = new double[frames.size()], slots = new double[frames.size()];
+    int fi = 0;
     for (DepthFrame f : frames) {
       long t0 = System.nanoTime();
       gpu.integrate(f);
@@ -104,6 +107,7 @@ public final class TestsActivity extends Activity {
       double g = (System.nanoTime() - t0) / 1e6;
       gpuMs += g;
       prepMs += gpu.lastCpuMs;
+      tot[fi] = g; touch[fi] = gpu.lastTouchMs; slots[fi] = gpu.lastSlotsMs; fi++;
       gpuMax = Math.max(gpuMax, g);
       long t1 = System.nanoTime();
       cf.integrateCpu(f);
@@ -160,7 +164,15 @@ public final class TestsActivity extends Activity {
             + "\"gpuMsPerFrame\":%.2f,\"gpuMsMax\":%.2f,\"prepMsPerFrame\":%.2f,\"cpuMsPerFrame\":%.2f,\"syncMs\":%.1f,\"blocks\":%d,\"dropped\":%d}",
         name, frames.size(), pass, frac, gv, cv, both, both > 0 ? close / (double) both : 0, onlyOne, maxDt,
         gpuMs / frames.size(), gpuMax, prepMs / frames.size(), cpuMs / frames.size(), syncMs, gf.volume.size(), gpu.dropped));
+    print(String.format(Locale.US, "{\"test\":\"%s tiempos\",\"medianMs\":%.2f,\"p90Ms\":%.2f,\"touchMedianMs\":%.2f,\"slotsMedianMs\":%.2f}",
+        name, pct(tot, 0.5), pct(tot, 0.9), pct(touch, 0.5), pct(slots, 0.5)));
     gpu.release();
+  }
+
+  private static double pct(double[] a, double q) {
+    double[] c = a.clone();
+    java.util.Arrays.sort(c);
+    return c.length == 0 ? 0 : c[Math.min(c.length - 1, (int) (q * c.length))];
   }
 
   private static long cell(float[] v, float voxel) {

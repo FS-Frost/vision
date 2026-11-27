@@ -95,6 +95,21 @@ final class Ui {
     return r;
   }
 
+  /**
+   * Android 15+ con targetSdk 35+ dibuja bajo las barras del sistema (edge-to-edge obligatorio):
+   * la vista recibe como padding los insets de las barras (más el padding extra indicado).
+   */
+  @SuppressWarnings("deprecation")
+  static void insets(View v, int extraDp) {
+    final int e = dp(v.getContext(), extraDp);
+    v.setOnApplyWindowInsetsListener((view, in) -> {
+      view.setPadding(in.getSystemWindowInsetLeft() + e, in.getSystemWindowInsetTop() + e,
+          in.getSystemWindowInsetRight() + e, in.getSystemWindowInsetBottom() + e);
+      return in;
+    });
+    v.requestApplyInsets();
+  }
+
   static String meters(float m) {
     return String.format(java.util.Locale.US, "%.2f m", m).replace('.', ',');
   }
