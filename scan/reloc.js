@@ -1,10 +1,19 @@
 // Relocalización global: encuentra dónde está la sesión actual dentro de un escaneo guardado
-// buscando en toda la habitación (posición en el suelo + giro).
-// Ambos marcos comparten la gravedad (+Y), así que la búsqueda gruesa es 2D: se comparan las
-// "plantas" (paredes y muebles vistos desde arriba) y luego el ICP 3D refina los candidatos.
+// buscando en toda la habitación (posición en el suelo + giro; la gravedad +Y es común).
+// Búsqueda gruesa-a-fina 3D (campo de proximidad de la superficie guardada) -> ICP 3D sobre las
+// mejores semillas -> orden por calidad y visibilidad. La decisión final la toma el usuario
+// (confirmación visual): aquí solo se ordenan candidatos.
 // Sin dependencias ni DOM: funciones puras sobre nubes { pos, nor, n } (testeable en Node).
 
 const DEG = Math.PI / 180;
+
+/**
+ * Parámetros ajustados con datos reales del moto g54: entre sesiones, la profundidad de ARCore
+ * discrepa ±10–15 cm a 1,5 m, así que las tolerancias de centímetros rechazaban hasta la pose
+ * correcta. minQuality solo descarta datos sin relación con la escena: el resto lo decide el
+ * usuario viendo la malla sobre la cámara.
+ */
+export const RELOC_PARAMS = { resTol: 0.05, cosTol: 0.5, visMargin: 0.25, visWeight: 2, minQuality: 0.03, maxShown: 5 };
 
 /** Altura del suelo: percentil bajo de los puntos con normal hacia arriba. */
 export function estimateFloor(cloud, fallback = null) {
@@ -157,6 +166,115 @@ export function searchFloorPlan(savedPlan, sessionPlan, opts = {}) {
   return nms(refined, 0.3, 8 * DEG, maxCandidates);
 }
 
+// ---------------------------------------------------------------- búsqueda 3D
+
+/** Campo de proximidad 3D: cada punto guardado salpica una gaussiana (máximo) en una grilla. */
+function scoreVolume(cloud, cell, sigma, pad) {
+  let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < cloud.n; i++) for (let a = 0; a < 3; a++) {
+    mn[a] = Math.min(mn[a], cloud.pos[i * 3 + a]); mx[a] = Math.max(mx[a], cloud.pos[i * 3 + a]);
+  }
+  const o = mn.map((v) => v - pad);
+  const dim = [0, 1, 2].map((a) => Math.ceil((mx[a] - mn[a] + 2 * pad) / cell) + 1);
+  const data = new Float32Array(dim[0] * dim[1] * dim[2]);
+  const r = Math.ceil((2.5 * sigma) / cell);
+  const k2 = 1 / (2 * sigma * sigma);
+  for (let i = 0; i < cloud.n; i++) {
+    const p = [cloud.pos[i * 3], cloud.pos[i * 3 + 1], cloud.pos[i * 3 + 2]];
+    const g = [0, 1, 2].map((a) => Math.floor((p[a] - o[a]) / cell));
+    for (let dz = -r; dz <= r; dz++) {
+      const z = g[2] + dz;
+      if (z < 0 || z >= dim[2]) continue;
+      for (let dy = -r; dy <= r; dy++) {
+        const y = g[1] + dy;
+        if (y < 0 || y >= dim[1]) continue;
+        for (let dx = -r; dx <= r; dx++) {
+          const x = g[0] + dx;
+          if (x < 0 || x >= dim[0]) continue;
+          const ex = (x + 0.5) * cell + o[0] - p[0], ey = (y + 0.5) * cell + o[1] - p[1], ez = (z + 0.5) * cell + o[2] - p[2];
+          const v = Math.exp(-(ex * ex + ey * ey + ez * ez) * k2);
+          const idx = (z * dim[1] + y) * dim[0] + x;
+          if (v > data[idx]) data[idx] = v;
+        }
+      }
+    }
+  }
+  return { o, dim, cell, data, mn, mx };
+}
+
+function scorePose3D(vol, q, c, s, tx, ty, tz) {
+  const { o, dim, cell, data } = vol;
+  let sum = 0;
+  for (let i = 0; i < q.length; i += 3) {
+    const x = c * q[i] + s * q[i + 2] + tx, y = q[i + 1] + ty, z = -s * q[i] + c * q[i + 2] + tz;
+    const gx = Math.floor((x - o[0]) / cell), gy = Math.floor((y - o[1]) / cell), gz = Math.floor((z - o[2]) / cell);
+    if (gx >= 0 && gy >= 0 && gz >= 0 && gx < dim[0] && gy < dim[1] && gz < dim[2]) sum += data[(gz * dim[1] + gy) * dim[0] + gx];
+  }
+  return sum;
+}
+
+function subsample3(cloud, max) {
+  const step = Math.max(1, cloud.n / max), n = Math.min(cloud.n, max), out = new Float32Array(n * 3);
+  for (let k = 0; k < n; k++) {
+    const i = Math.floor(k * step) * 3;
+    out[k * 3] = cloud.pos[i]; out[k * 3 + 1] = cloud.pos[i + 1]; out[k * 3 + 2] = cloud.pos[i + 2];
+  }
+  return out;
+}
+
+/**
+ * Búsqueda gruesa-a-fina 3D de (yaw, tx, tz) con la altura fijada por los suelos (dy).
+ * Usa la forma completa (alturas de muebles, etc.), no solo su sombra en el suelo.
+ * @returns {Array<{yaw, tx, ty, tz, score}>}
+ */
+export function searchVolume(savedCloud, sessionCloud, dy, opts = {}) {
+  const maxCandidates = opts.maxCandidates ?? 8;
+  if (savedCloud.n < 100 || sessionCloud.n < 100) return [];
+  const coarse = scoreVolume(savedCloud, 0.1, 0.15, 0.4);
+  const qc = subsample3(sessionCloud, 300);
+  const step = 0.2, yawStep = (opts.yawStepDeg ?? 5) * DEG;
+  const all = [];
+  for (let yaw = 0; yaw < 2 * Math.PI - 1e-9; yaw += yawStep) {
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const best = [];
+    for (let tx = coarse.mn[0] - 0.4; tx <= coarse.mx[0] + 0.4; tx += step) {
+      for (let tz = coarse.mn[2] - 0.4; tz <= coarse.mx[2] + 0.4; tz += step) {
+        const sc = scorePose3D(coarse, qc, c, s, tx, dy, tz);
+        if (best.length < 3 || sc > best[best.length - 1].score) {
+          best.push({ yaw, tx, tz, score: sc });
+          best.sort((a, b) => b.score - a.score);
+          if (best.length > 3) best.pop();
+        }
+      }
+    }
+    all.push(...best);
+  }
+  all.sort((a, b) => b.score - a.score);
+  const seeds = nms(all, 0.5, 20 * DEG, maxCandidates * 2);
+
+  // fino: ±0.2 m cada 5 cm, ±6° cada 1.5°, altura ±6 cm
+  const fine = scoreVolume(savedCloud, 0.05, 0.07, 0.2);
+  const qf = subsample3(sessionCloud, 600);
+  const refined = seeds.map((sd) => {
+    let best = { ...sd, ty: dy, score: -1 };
+    for (let da = -6; da <= 6; da += 1.5) {
+      const yaw = sd.yaw + da * DEG, c = Math.cos(yaw), s = Math.sin(yaw);
+      for (const ddy of [-0.06, 0, 0.06]) {
+        for (let dx = -0.2; dx <= 0.2001; dx += 0.05) {
+          for (let dz = -0.2; dz <= 0.2001; dz += 0.05) {
+            const sc = scorePose3D(fine, qf, c, s, sd.tx + dx, dy + ddy, sd.tz + dz);
+            if (sc > best.score) best = { yaw, tx: sd.tx + dx, ty: dy + ddy, tz: sd.tz + dz, score: sc };
+          }
+        }
+      }
+    }
+    best.score /= qf.length / 3;
+    return best;
+  });
+  refined.sort((a, b) => b.score - a.score);
+  return nms(refined, 0.3, 8 * DEG, maxCandidates);
+}
+
 function invRigid(m) {
   const o = new Float64Array(16);
   o[0] = m[0]; o[1] = m[4]; o[2] = m[8];
@@ -221,16 +339,25 @@ export function visibilityCheck(savedCloud, frames, matrix, { maxPoints = 2500, 
  * los aporta la Fusion guardada (así este módulo no depende de fusion-core).
  * @returns {{ ok, ambiguous, candidates: Array<{yaw, t, matrix, quality, planScore}>, reason? }}
  */
-export function relocalize(savedCloud, sessionCloud, { refine, score, frames = null, sessionFloorFallback = null, minQuality = 0.2, visWeight = 5 } = {}) {
+export function relocalize(savedCloud, sessionCloud, {
+  refine, score, frames = null, sessionFloorFallback = null, method = 'volume',
+  minQuality = RELOC_PARAMS.minQuality, visWeight = RELOC_PARAMS.visWeight, visMargin = RELOC_PARAMS.visMargin,
+} = {}) {
   const savedFloor = estimateFloor(savedCloud);
   const sessionFloor = estimateFloor(sessionCloud, sessionFloorFallback);
-  const sp = floorPlan(savedCloud, savedFloor), qp = floorPlan(sessionCloud, sessionFloor);
-  if (qp.length / 2 < 20) return { ok: false, ambiguous: false, candidates: [], reason: 'pocas paredes o muebles a la vista' };
-  const coarse = searchFloorPlan(sp, qp);
   const dy = savedFloor - sessionFloor;
+  let coarse;
+  if (method === 'plan') {
+    const sp = floorPlan(savedCloud, savedFloor), qp = floorPlan(sessionCloud, sessionFloor);
+    if (qp.length / 2 < 20) return { ok: false, ambiguous: false, candidates: [], reason: 'pocas paredes o muebles a la vista' };
+    coarse = searchFloorPlan(sp, qp).map((c) => ({ ...c, ty: dy }));
+  } else {
+    if (sessionCloud.n < 100) return { ok: false, ambiguous: false, candidates: [], reason: 'poca geometría a la vista' };
+    coarse = searchVolume(savedCloud, sessionCloud, dy);
+  }
   const out = [];
   for (const c of coarse) {
-    const r = refine([c.yaw, c.tx, dy, c.tz]);
+    const r = refine([c.yaw, c.tx, c.ty, c.tz]);
     const quality = score(r.yaw, r.t);
     const dup = out.find((o) => Math.hypot(o.t[0] - r.t[0], o.t[2] - r.t[2]) < 0.1 && angDiff(o.yaw, r.yaw) < 3 * DEG);
     if (dup) { if (quality > dup.quality) Object.assign(dup, { ...r, quality, planScore: c.score }); continue; }
@@ -238,7 +365,7 @@ export function relocalize(savedCloud, sessionCloud, { refine, score, frames = n
   }
   // orden final: calidad penalizada por "ver a través" de superficies guardadas
   for (const c of out) {
-    c.visibility = frames?.length ? visibilityCheck(savedCloud, frames, c.matrix).rate : 0;
+    c.visibility = frames?.length ? visibilityCheck(savedCloud, frames, c.matrix, { margin: visMargin }).rate : 0;
     c.rank = c.quality - visWeight * c.visibility;
   }
   out.sort((a, b) => b.rank - a.rank);

@@ -604,19 +604,22 @@ export class Fusion {
    * (coseno > 0.8). A diferencia del rms de alignPoints, sí distingue una pared encajada en
    * el sitio correcto de una que solo "cae cerca".
    */
-  scorePose(src, srcNor, yaw, t) {
+  scorePose(src, srcNor, yaw, t, { resTol = 0.02, cosTol = 0.8 } = {}) {
     const T = this._targetCloud();
-    if (!T.grid5) {
-      const G = 0.05, cells = new Map();
+    // radio de búsqueda del vecino >= tolerancia (grilla cacheada por tamaño de celda)
+    const G = Math.max(0.05, Math.ceil(resTol * 1.5 * 100) / 100);
+    T.grids ??= {};
+    if (!T.grids[G]) {
+      const cellsNew = new Map();
       for (let i = 0; i < T.n; i++) {
         const key = gridKey(Math.floor(T.pos[i * 3] / G), Math.floor(T.pos[i * 3 + 1] / G), Math.floor(T.pos[i * 3 + 2] / G));
-        let l = cells.get(key);
-        if (!l) { l = []; cells.set(key, l); }
+        let l = cellsNew.get(key);
+        if (!l) { l = []; cellsNew.set(key, l); }
         l.push(i);
       }
-      T.grid5 = { G, cells };
+      T.grids[G] = cellsNew;
     }
-    const { G, cells } = T.grid5;
+    const cells = T.grids[G];
     const c = Math.cos(yaw), s = Math.sin(yaw);
     const n = src.length / 3;
     let good = 0;
@@ -638,7 +641,7 @@ export class Fusion {
       if (best < 0) continue;
       const tnx = T.nor[best * 3], tny = T.nor[best * 3 + 1], tnz = T.nor[best * 3 + 2];
       const r = tnx * (qx - T.pos[best * 3]) + tny * (qy - T.pos[best * 3 + 1]) + tnz * (qz - T.pos[best * 3 + 2]);
-      if (Math.abs(r) < 0.02 && nx * tnx + ny * tny + nz * tnz > 0.8) good++;
+      if (Math.abs(r) < resTol && nx * tnx + ny * tny + nz * tnz > cosTol) good++;
     }
     return n ? good / n : 0;
   }

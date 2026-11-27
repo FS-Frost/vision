@@ -94,13 +94,13 @@ function handle(m) {
         const step = Math.max(1, Math.floor(relocFrames.length / RELOC_VIS_FRAMES));
         const r = reloc.relocalize(fusion.surfaceCloud(), sc, {
           refine: (init) => fusion.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
-          score: (yaw, t) => fusion.scorePose(sc.pos, sc.nor, yaw, t),
+          score: (yaw, t) => fusion.scorePose(sc.pos, sc.nor, yaw, t, { resTol: reloc.RELOC_PARAMS.resTol, cosTol: reloc.RELOC_PARAMS.cosTol }),
           frames: relocFrames.filter((_, i) => i % step === 0),
           sessionFloorFallback: relocFloorFallback,
         });
         self.postMessage({
           type: 'reloc-result', ok: r.ok, ambiguous: r.ambiguous, reason: r.reason, ms: performance.now() - t0,
-          candidates: r.candidates.slice(0, 5).map((c) => ({
+          candidates: r.candidates.slice(0, reloc.RELOC_PARAMS.maxShown).map((c) => ({
             matrix: Array.from(c.matrix), yaw: c.yaw, t: c.t, quality: c.quality, visibility: c.visibility, rank: c.rank,
           })),
         });

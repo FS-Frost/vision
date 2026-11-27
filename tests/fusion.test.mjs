@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Fusion, mul4, invertRigid, yawMatrix } from '../scan/fusion-core.js';
 import { Collider } from '../scan/collider.js';
-import { relocalize } from '../scan/reloc.js';
+import { relocalize, RELOC_PARAMS } from '../scan/reloc.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -392,7 +392,7 @@ function relocTrial(saved, savedCloud, A, startX, startZ) {
   const sc = sess.surfaceCloud();
   return relocalize(savedCloud, sc, {
     refine: (init) => saved.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
-    score: (yaw, t) => saved.scorePose(sc.pos, sc.nor, yaw, t),
+    score: (yaw, t) => saved.scorePose(sc.pos, sc.nor, yaw, t, RELOC_PARAMS),
     frames: frames.filter((_, i) => i % 2 === 0),
   });
 }
@@ -436,7 +436,7 @@ test('relocalización: datos de otra habitación no dan un candidato válido', (
   const sc = other.surfaceCloud();
   const r = relocalize(saved.surfaceCloud(), sc, {
     refine: (init) => saved.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
-    score: (yaw, t) => saved.scorePose(sc.pos, sc.nor, yaw, t),
+    score: (yaw, t) => saved.scorePose(sc.pos, sc.nor, yaw, t, RELOC_PARAMS),
   });
   // una pared plana encaja en cualquier pared: debe marcarse ambiguo o no válido, nunca un acierto "claro"
   assert.ok(!r.ok || r.ambiguous, `aceptó sin ambigüedad: ${JSON.stringify(r.candidates[0] && { q: r.candidates[0].quality })}`);
