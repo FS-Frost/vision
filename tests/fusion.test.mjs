@@ -1,9 +1,9 @@
 // Tests del núcleo de fusión. Ejecutar: node --test tests/*.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Fusion, mul4, invertRigid, yawMatrix } from '../scan/fusion-core.js';
+import { Fusion, mul4, invertRigid, yawMatrix, depthWeight } from '../scan/fusion-core.js';
 import { Collider } from '../scan/collider.js';
-import { relocalize, RELOC_PARAMS, liveAgreement } from '../scan/reloc.js';
+import { relocalize, RELOC_PARAMS, liveAgreement, startGuess } from '../scan/reloc.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -375,11 +375,14 @@ test('continuar: lo ya escaneado no cambia aunque la alineación tenga 5 cm de e
 });
 
 // ---------------------------------------------------------------- relocalización global
+// Estos tests miden el ALGORITMO de búsqueda con un sensor ideal (profundidad perfecta a
+// cualquier distancia), así que desactivan el corte/peso por distancia de la captura real.
+const IDEAL = { maxDepth: 4, nearFull: 4 };
 
 function relocTrial(saved, savedCloud, A, startX, startZ) {
   // sesión nueva: barrido de 360° desde (startX, startZ); la sesión reporta poses en su propio marco
   const Ainv = invertRigid(A);
-  const sess = new Fusion({ voxel: 0.05, minWeight: 1 });
+  const sess = new Fusion({ voxel: 0.05, minWeight: 1, ...IDEAL });
   const frames = [];
   for (let yaw = 0; yaw < 2 * Math.PI; yaw += Math.PI / 8) {
     for (const pitch of [-0.35, 0]) {
@@ -398,7 +401,7 @@ function relocTrial(saved, savedCloud, A, startX, startZ) {
 }
 
 test('relocalización global: 20 inicios al azar (cualquier punto y giro)', () => {
-  const saved = new Fusion({ voxel: 0.03 });
+  const saved = new Fusion({ voxel: 0.03, ...IDEAL });
   scanRoom(saved);
   const savedCloud = saved.surfaceCloud();
   let seed = 7;
@@ -425,10 +428,10 @@ test('relocalización global: 20 inicios al azar (cualquier punto y giro)', () =
 });
 
 test('relocalización: datos de otra habitación no dan un candidato válido', () => {
-  const saved = new Fusion({ voxel: 0.03 });
+  const saved = new Fusion({ voxel: 0.03, ...IDEAL });
   scanRoom(saved);
   // "otra habitación": una sola pared lejana y suelo, sin la geometría de la guardada
-  const other = new Fusion({ voxel: 0.05, minWeight: 1 });
+  const other = new Fusion({ voxel: 0.05, minWeight: 1, ...IDEAL });
   for (let yaw = -0.6; yaw <= 0.6; yaw += 0.2) {
     const M = pose(yaw, -0.3, 0, 1.3, 0);
     other.integrate(frameOf(planeDepth(2.2), M));
@@ -443,7 +446,7 @@ test('relocalización: datos de otra habitación no dan un candidato válido', (
 });
 
 test('coincidencia en vivo: la pose correcta coincide más que la girada 180°', () => {
-  const saved = new Fusion({ voxel: 0.03 });
+  const saved = new Fusion({ voxel: 0.03, ...IDEAL });
   scanRoom(saved);
   const cloud = saved.surfaceCloud();
   const A = yawMatrix(0.7, 0.4, 0, -0.3);                  // verdad: sesión -> guardado
@@ -460,4 +463,50 @@ test('coincidencia en vivo: la pose correcta coincide más que la girada 180°',
   console.log(`coincidencia en vivo: correcta ${(good * 100).toFixed(0)}%, girada 180° ${(bad * 100).toFixed(0)}%`);
   assert.ok(good > 0.8, `la correcta debería coincidir: ${good}`);
   assert.ok(bad < good - 0.3, `la girada debería coincidir claramente menos: ${bad}`);
+});
+
+test('captura: el peso de la profundidad baja con la distancia y se corta a 3 m', () => {
+  assert.equal(depthWeight(0.8), 1);
+  assert.equal(depthWeight(1.5), 1);
+  assert.ok(Math.abs(depthWeight(2.25) - 0.5) < 1e-9);
+  assert.equal(depthWeight(3.0), 0);
+  assert.equal(depthWeight(3.5), 0);
+  // una pared a 3.5 m no se integra; a 1.5 m sí
+  const far = new Fusion({ voxel: 0.04 });
+  for (let k = 0; k < 4; k++) far.integrate({ depth: planeDepth(3.5), width: W, height: H, rawToMeters: 0.001, normViewFromNormDepth: IDENT, projection: PROJ, viewMatrix: IDENT });
+  assert.equal(far.stats().blocks, 0);
+  const near = new Fusion({ voxel: 0.04 });
+  for (let k = 0; k < 4; k++) near.integrate({ depth: planeDepth(1.5), width: W, height: H, rawToMeters: 0.001, normViewFromNormDepth: IDENT, projection: PROJ, viewMatrix: IDENT });
+  assert.ok(near.stats().blocks > 0);
+});
+
+test('pista de inicio: startGuess recupera la transformación y su candidato siempre aparece', () => {
+  const saved = new Fusion({ voxel: 0.03, ...IDEAL });
+  scanRoom(saved);
+  const A = yawMatrix(-1.9, 0.8, 0.05, -0.6);          // verdad: sesión -> guardado
+  const Ainv = invertRigid(A);
+  // el escaneo guardado empezó aquí (marco guardado); la sesión nueva empieza en el mismo sitio
+  const P0 = pose(0.15, -0.2, 0, 1.3, 0);
+  const S0 = mul4(Ainv, P0);
+  const g = startGuess(P0, S0);
+  assert.ok(Math.abs(Math.atan2(Math.sin(g.yaw + 1.9), Math.cos(g.yaw + 1.9))) < 1e-6, `yaw ${g.yaw}`);
+  assert.ok(Math.hypot(g.tx - 0.8, g.ty - 0.05, g.tz + 0.6) < 1e-6);
+  // barrido corto (poca cobertura): aun así el candidato del inicio está y es correcto
+  const sess = new Fusion({ voxel: 0.05, minWeight: 1, ...IDEAL });
+  for (const yaw of [0.15, 0.35, -0.05]) {
+    const Mw = pose(yaw, -0.3, 0, 1.3, 0);
+    sess.integrate(frameOf(roomDepth(Mw), mul4(Ainv, Mw)));
+  }
+  const sc = sess.surfaceCloud();
+  // pista aproximada: el usuario se puso ~10 cm y ~5° fuera del punto inicial
+  const approx = { ...g, yaw: g.yaw + 0.09, tx: g.tx + 0.07, tz: g.tz - 0.07 };
+  const r = relocalize(saved.surfaceCloud(), sc, {
+    refine: (init) => saved.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
+    score: (yaw, tt) => saved.scorePose(sc.pos, sc.nor, yaw, tt, RELOC_PARAMS),
+    extraSeeds: [approx],
+  });
+  const start = r.candidates.find((c) => c.tag === 'inicio');
+  assert.ok(start, 'falta el candidato del punto inicial');
+  const dyaw = Math.abs(Math.atan2(Math.sin(start.yaw + 1.9), Math.cos(start.yaw + 1.9)));
+  assert.ok(dyaw < 0.02 && Math.hypot(start.t[0] - 0.8, start.t[2] + 0.6) < 0.04, `candidato inicio: yaw ${start.yaw} t ${start.t}`);
 });

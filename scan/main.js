@@ -8,7 +8,7 @@ import { WalkControls } from './walk.js';
 import { Collider } from './collider.js';
 import { buildViewerHtml, shareOrDownload, importFile } from './share.js';
 import * as db from './db.js';
-import { liveAgreement } from './reloc.js';
+import { liveAgreement, startGuess } from './reloc.js';
 
 const params = new URLSearchParams(location.search);
 const SEND_INTERVAL_MS = 1000 / (parseFloat(params.get('hz')) || 10);
@@ -38,7 +38,8 @@ const ui = {
   exportBtn: $('#btn-export'), homeBtn: $('#btn-home'), newBtn: $('#btn-new'),
   overlay: $('#overlay'), hud: $('#hud'), hint: $('#hint'), pause: $('#btn-pause'), stop: $('#btn-stop'),
   relocBar: $('#reloc-bar'), relocText: $('#reloc-text'), relocOk: $('#btn-reloc-ok'),
-  relocOther: $('#btn-reloc-other'), relocBlink: $('#btn-reloc-blink'), relocRetry: $('#btn-reloc-retry'),
+  relocOther: $('#btn-reloc-other'), relocBlink: $('#btn-reloc-blink'),
+  startPhotoBox: $('#start-photo-box'), startPhoto: $('#start-photo'), relocRetry: $('#btn-reloc-retry'),
   joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
   walkBar: $('#walk-bar'), walkExit: $('#btn-walk-exit'), collide: $('#btn-collide'),
 };
@@ -376,6 +377,7 @@ async function startScan(continueFrom = null) {
     mode: 'scan', paused: false, sent: 0, dropped: 0, colorFrames: 0, fusion: null,
     continuing: !!continueFrom, volume: null,
     reloc: continueFrom ? newReloc() : null,
+    capture: continueFrom ? null : newCapture(),
   });
   ui.relocBar.hidden = true;
   ui.pause.textContent = 'Pausar';
@@ -405,10 +407,7 @@ async function onSessionEnd() {
     // Diagnóstico: conservar el resultado y los frames del barrido (window.vision.lastReloc).
     const rl = state.reloc;
     const dump = await new Promise((res) => { dumpResolve = res; worker.postMessage({ type: 'reloc-dump' }); });
-    state.lastReloc = {
-      scanId: state.meta?.id, refSpace: state.refSpace, coverage: rl?.coverage, attempts: rl?.attempts,
-      result: rl?.result, candidates: rl?.candidates ?? [], frames: dump.frames, sessionFloorFallback: dump.sessionFloorFallback,
-    };
+    state.lastReloc = { ...relocSummary(rl), confirmed: false, frames: dump.frames, sessionFloorFallback: dump.sessionFloorFallback };
     worker.postMessage({ type: 'reloc-reset' });
     state.continuing = false;
     state.reloc = null;
@@ -416,6 +415,7 @@ async function onSessionEnd() {
     ui.viewerText.textContent = 'No se confirmó la posición en el escaneo guardado; no se modificó.';
     return;
   }
+  if (state.continuing && state.reloc) state.lastReloc = { ...relocSummary(state.reloc), confirmed: true, frames: [] };
   await new Promise((res) => { flushResolve = res; worker.postMessage({ type: 'flush' }); });
   state.hasColor = (state.fusion?.colorFrames ?? 0) > 0 || (state.continuing && state.hasColor);
   const prev = state.continuing ? state.meta : null;
@@ -430,8 +430,13 @@ async function onSessionEnd() {
       name,
       voxel: state.fusion?.voxel, hasColor: state.hasColor, volume: state.volume,
       chunks: [...chunks.values()].map((c) => c.data),
+      startPose: prev ? prev.startPose : state.capture?.startPose,
+      startPhoto: prev ? prev.startPhoto : state.capture?.startPhoto,
     });
-    state.meta = { id, name, createdAt: Date.now(), voxel: state.fusion?.voxel, hasVolume: !!state.volume };
+    state.meta = {
+      id, name, createdAt: Date.now(), voxel: state.fusion?.voxel, hasVolume: !!state.volume,
+      startPose: prev ? prev.startPose : state.capture?.startPose, startPhoto: prev ? prev.startPhoto : state.capture?.startPhoto,
+    };
     showViewer(state.meta);
     ui.viewerText.textContent = prev
       ? 'Ampliación guardada como escaneo nuevo; el original se conserva en Mis escaneos.'
@@ -466,7 +471,11 @@ function onXRFrame(time, frame) {
   if (!pose || pose.emulatedPosition) { state.tracking = 'perdido'; return; }
   state.tracking = 'ok';
   const rl = state.continuing ? state.reloc : null;
-  if (rl && rl.phase === 'sweep') updateSweepCoverage(pose.transform.orientation);
+  if (rl && rl.phase === 'sweep') {
+    updateSweepCoverage(pose.transform.orientation);
+    rl.sessionStart ??= Array.from(pose.views[0].transform.matrix);
+  }
+  if (state.capture) updateCaptureCoverage(pose.views[0]);
   if (rl && rl.phase === 'confirm') { confirmFrame(time, frame, pose.views[0]); return; }
   if (rl && rl.phase !== 'sweep' && rl.phase !== 'done') return; // buscando o integrando
   const interval = rl && rl.phase === 'sweep' ? RELOC_INTERVAL_MS : SEND_INTERVAL_MS;
@@ -497,7 +506,11 @@ function onXRFrame(time, frame) {
     rl.lastSolveAt = performance.now();
     rl.attempts++;
     workerBusy = true;
-    worker.postMessage({ type: 'reloc-solve' });
+    const savedStart = state.meta?.startPose;
+    worker.postMessage({
+      type: 'reloc-solve',
+      startGuess: savedStart && rl.sessionStart ? startGuess(savedStart, rl.sessionStart) : null,
+    });
   });
 }
 
@@ -508,12 +521,56 @@ function sendWithColor(msg, transfer, view) {
   if (!colorPromise) { worker.postMessage(msg, transfer); return Promise.resolve(); }
   return colorPromise
     .then((c) => {
+      if (state.capture && !state.capture.startPhoto && state.capture.startPose) {
+        state.capture.startPhoto = colorToDataURL(c.buf, c.w, c.h);
+      }
       msg.color = c.buf.buffer; msg.colorWidth = c.w; msg.colorHeight = c.h;
       transfer.push(c.buf.buffer);
       state.colorFrames++;
     })
     .catch((err) => logError('color', err))
     .finally(() => worker.postMessage(msg, transfer));
+}
+
+// ---------------------------------------------------------------- captura: cobertura y pista de inicio
+
+function newCapture() {
+  return { bins: new Uint8Array(SWEEP_BINS), coverage: 0, up: false, down: false, level: false, startPose: null, startPhoto: null };
+}
+
+/** Cobertura del escaneo nuevo: direcciones horizontales + mirar arriba/abajo. Fija la pose inicial. */
+function updateCaptureCoverage(view) {
+  const cap = state.capture;
+  cap.startPose ??= Array.from(view.transform.matrix);
+  const q = view.transform.orientation;
+  const fx = -2 * (q.x * q.z + q.w * q.y);
+  const fy = 2 * (q.w * q.x - q.y * q.z);
+  const fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+  if (fy > 0.35) cap.up = true; else if (fy < -0.35) cap.down = true; else cap.level = true;
+  if (Math.hypot(fx, fz) < 0.3) return;
+  const a = Math.atan2(fx, -fz);
+  cap.bins[Math.floor(((a + Math.PI) / (2 * Math.PI)) * SWEEP_BINS) % SWEEP_BINS] = 1;
+  cap.coverage = cap.bins.reduce((acc, v) => acc + v, 0) / SWEEP_BINS;
+}
+
+/** RGBA (fila 0 = abajo de la vista) -> JPEG pequeño en data URL. */
+function colorToDataURL(buf, w, h) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) img.data.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+  ctx.putImageData(img, 0, 0);
+  return canvas.toDataURL('image/jpeg', 0.75);
+}
+
+/** Resumen de una relocalización para diagnóstico por USB (window.vision.lastReloc). */
+function relocSummary(rl) {
+  return {
+    scanId: state.meta?.id, refSpace: state.refSpace, coverage: rl?.coverage, attempts: rl?.attempts,
+    result: rl?.result, candidates: rl?.candidates ?? [], chosen: rl?.idx, recommended: rl?.recommended,
+    live: (rl?.live ?? []).map((v) => ({ ratio: +v.ratio.toFixed(3), match: v.match, through: v.through })),
+  };
 }
 
 // ---------------------------------------------------------------- relocalización (continuar)
@@ -615,7 +672,7 @@ function updateRelocText() {
   const rl = state.reloc;
   const c = rl.live[rl.idx];
   const pct = c && c.match + c.through > 0 ? `${Math.round(c.ratio * 100)}% coincide` : 'midiendo…';
-  const rec = rl.recommended === rl.idx ? ' · RECOMENDADO' : '';
+  const rec = (rl.recommended === rl.idx ? ' · RECOMENDADO' : '') + (rl.candidates[rl.idx]?.tag === 'inicio' ? ' · punto inicial' : '');
   ui.relocText.textContent =
     `Posición ${rl.idx + 1} de ${rl.candidates.length}: ${pct}${rec}\n` +
     (rl.blink ? 'Parpadeo: si al aparecer y desaparecer nada salta, coincide.'
@@ -915,9 +972,20 @@ setInterval(() => {
       done: `alineado ✓ confirmado · solo zonas nuevas · ${rl.integrated} frames del barrido`,
     }[rl.phase] ?? '';
   }
+  let coverLine = '';
+  if (state.capture) {
+    const cap = state.capture;
+    const ring = Array.from(cap.bins, (v) => (v ? '■' : '·')).join('');
+    const missing = [!cap.up && 'arriba', !cap.down && 'abajo'].filter(Boolean).join(' y ');
+    coverLine = `cobertura ${Math.round(cap.coverage * 100)}% ${ring}${missing ? `\nfalta mirar ${missing}` : ''}`;
+  }
+  const showPhoto = state.continuing && state.reloc?.phase === 'sweep' && !!state.meta?.startPhoto;
+  if (showPhoto && ui.startPhoto.src !== state.meta.startPhoto) ui.startPhoto.src = state.meta.startPhoto;
+  ui.startPhotoBox.hidden = !showPhoto;
   ui.hud.textContent = [
     `fps ${state.fps}   tracking ${state.tracking}${state.paused ? '   PAUSA' : ''}`,
     alignLine,
+    coverLine,
     `depth ${state.depth ? `${state.depth.width}x${state.depth.height}` : '-'}   color ${state.colorFrames ? `ok ${state.colorMs.toFixed(0)} ms` : '-'}`,
     `fusión ${state.integrateMs.toFixed(1)} ms   malla ${state.meshMs.toFixed(1)} ms`,
     f ? `bloques ${f.blocks}   tri ${f.triangles.toLocaleString('es')}   ${f.memoryMB} MB` : 'bloques -',
@@ -928,7 +996,12 @@ setInterval(() => {
     ui.hint.textContent = 'Tracking perdido: mueve el teléfono despacio y apunta a zonas con textura';
   } else if (state.continuing && state.reloc?.phase === 'sweep') {
     ui.hint.hidden = false;
-    ui.hint.textContent = 'Gira despacio sobre ti mismo mirando paredes y muebles';
+    ui.hint.textContent = state.meta?.startPhoto
+      ? 'Ponte donde se tomó la foto, mírala igual y luego gira despacio'
+      : 'Gira despacio sobre ti mismo mirando paredes y muebles';
+  } else if (state.capture && state.capture.coverage < 0.6) {
+    ui.hint.hidden = false;
+    ui.hint.textContent = 'Mira paredes y esquinas, no solo objetos; gira despacio';
   } else {
     ui.hint.hidden = true;
   }

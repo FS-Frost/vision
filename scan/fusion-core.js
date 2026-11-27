@@ -68,6 +68,16 @@ const W_NEIGHBORS = [1, -1, SW, -SW, SW * SW, -SW * SW];
 
 const now = () => (globalThis.performance ? performance.now() : Date.now());
 
+/**
+ * Peso de una muestra de profundidad según su distancia: la precisión de ARCore cae con la
+ * distancia (medido en el g54). 1 hasta nearFull, baja linealmente hasta 0 en far.
+ */
+export function depthWeight(d, nearFull = 1.5, far = 3.0) {
+  if (d <= nearFull) return 1;
+  if (d >= far) return 0;
+  return (far - d) / (far - nearFull);
+}
+
 /** Producto de matrices 4x4 column-major: a * b */
 export function mul4(a, b) {
   const o = new Float64Array(16);
@@ -125,7 +135,8 @@ export class Fusion {
     this.voxel = opts.voxel ?? 0.03;
     this.trunc = opts.truncation ?? this.voxel * 3;
     this.minDepth = opts.minDepth ?? 0.2;
-    this.maxDepth = opts.maxDepth ?? 4.0;
+    this.maxDepth = opts.maxDepth ?? 3.0;
+    this.nearFull = opts.nearFull ?? 1.5;   // peso completo hasta aquí; luego baja hasta maxDepth
     this.maxWeight = opts.maxWeight ?? 32;
     this.minWeight = opts.minWeight ?? 2;        // muestras vistas menos veces se ignoran (ruido)
     this.dilate = opts.dilate ?? true;           // cierra huecos de 1 voxel
@@ -190,7 +201,8 @@ export class Fusion {
       for (let i = 0; i < width; i += st) {
         const id = j * width + i;
         const d = depth[id] * k;
-        if (!(d >= minD && d <= maxD)) continue;
+        if (!(d >= minD && d < maxD)) continue;
+        const wd = depthWeight(d, this.nearFull, maxD);
         // "flying pixels": descarta píxeles en discontinuidades de profundidad
         if (i + 1 < width && Math.abs(depth[id + 1] * k - d) > jump * d) continue;
         if (j + 1 < height && Math.abs(depth[id + width] * k - d) > jump * d) continue;
@@ -242,8 +254,8 @@ export class Fusion {
           if (b.frozen && b.frozen[li]) continue; // voxel del escaneo original: no se toca
           let tsdf = -s / trunc;
           if (tsdf > 1) tsdf = 1; else if (tsdf < -1) tsdf = -1;
-          const w0 = b.w[li], w1 = w0 + 1;
-          b.t[li] = (b.t[li] * w0 + tsdf) / w1;
+          const w0 = b.w[li], w1 = w0 + wd;
+          b.t[li] = (b.t[li] * w0 + tsdf * wd) / w1;
           b.w[li] = w1 < maxW ? w1 : maxW;
           if (cr >= 0 && n >= -1 && n <= 1) {
             const c0 = b.cw[li];

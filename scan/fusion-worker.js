@@ -97,11 +97,16 @@ function handle(m) {
           score: (yaw, t) => fusion.scorePose(sc.pos, sc.nor, yaw, t, { resTol: reloc.RELOC_PARAMS.resTol, cosTol: reloc.RELOC_PARAMS.cosTol }),
           frames: relocFrames.filter((_, i) => i % step === 0),
           sessionFloorFallback: relocFloorFallback,
+          extraSeeds: m.startGuess ? [m.startGuess] : [],
         });
+        // mostrar los mejores y, siempre, el candidato del punto inicial
+        const shown = r.candidates.slice(0, reloc.RELOC_PARAMS.maxShown);
+        const start = r.candidates.find((c) => c.tag === 'inicio');
+        if (start && !shown.includes(start)) shown.push(start);
         self.postMessage({
           type: 'reloc-result', ok: r.ok, ambiguous: r.ambiguous, reason: r.reason, ms: performance.now() - t0,
-          candidates: r.candidates.slice(0, reloc.RELOC_PARAMS.maxShown).map((c) => ({
-            matrix: Array.from(c.matrix), yaw: c.yaw, t: c.t, quality: c.quality, visibility: c.visibility, rank: c.rank,
+          candidates: shown.map((c) => ({
+            matrix: Array.from(c.matrix), yaw: c.yaw, t: c.t, quality: c.quality, visibility: c.visibility, rank: c.rank, tag: c.tag,
           })),
         });
         break;

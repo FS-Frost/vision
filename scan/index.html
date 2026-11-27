@@ -50,6 +50,8 @@
   #overlay .hud { align-self: flex-start; background: rgba(0,0,0,.55); border-radius: 10px; padding: 8px 10px;
     font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre; color: #fff; }
   #overlay .row { pointer-events: auto; justify-content: center; }
+  #start-photo-box { align-self: center; background: rgba(0,0,0,.6); border-radius: 10px; padding: 6px; color: #fff; text-align: center; font-size: 12px; }
+  #start-photo { display: block; width: 28vw; max-width: 140px; border-radius: 6px; margin: 0 auto 4px; }
   #reloc-bar { pointer-events: auto; align-self: stretch; background: rgba(0,0,0,.7); border-radius: 12px; padding: 10px; color: #fff; }
   #reloc-text { margin-bottom: 8px; text-align: center; white-space: pre-line; }
   #hint { align-self: center; background: rgba(0,0,0,.55); border-radius: 999px; padding: 6px 14px; color: #fff; text-align: center; }
@@ -131,6 +133,10 @@
 <div id="overlay" hidden>
   <div class="hud" id="hud">Iniciando…</div>
   <div id="hint">Mueve el teléfono despacio</div>
+  <div id="start-photo-box" hidden>
+    <img id="start-photo" alt="Vista al empezar el escaneo original">
+    <div>Así se veía al empezar: ponte ahí</div>
+  </div>
   <div id="reloc-bar" hidden>
     <div id="reloc-text"></div>
     <div class="row">

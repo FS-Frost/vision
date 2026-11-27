@@ -275,6 +275,24 @@ export function searchVolume(savedCloud, sessionCloud, dy, opts = {}) {
   return nms(refined, 0.3, 8 * DEG, maxCandidates);
 }
 
+/**
+ * Suposición "la sesión empezó en el punto inicial del escaneo guardado": dadas la pose de la
+ * cámara al empezar el escaneo (marco guardado) y al empezar la sesión (marco de la sesión),
+ * devuelve la transformación sesión -> guardado reducida a giro (yaw) + traslación.
+ */
+export function startGuess(savedStartPose, sessionStartPose) {
+  const A = mul(savedStartPose, invRigid(sessionStartPose));
+  return { yaw: Math.atan2(A[8], A[0]), tx: A[12], ty: A[13], tz: A[14], tag: 'inicio' };
+}
+
+function mul(a, b) {
+  const o = new Float64Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+
 function invRigid(m) {
   const o = new Float64Array(16);
   o[0] = m[0]; o[1] = m[4]; o[2] = m[8];
@@ -364,7 +382,7 @@ function forEachProjected(savedCloud, frames, matrix, maxPoints, cb) {
  * @returns {{ ok, ambiguous, candidates: Array<{yaw, t, matrix, quality, planScore}>, reason? }}
  */
 export function relocalize(savedCloud, sessionCloud, {
-  refine, score, frames = null, sessionFloorFallback = null, method = 'volume',
+  refine, score, frames = null, sessionFloorFallback = null, method = 'volume', extraSeeds = [],
   minQuality = RELOC_PARAMS.minQuality, visWeight = RELOC_PARAMS.visWeight, visMargin = RELOC_PARAMS.visMargin,
 } = {}) {
   const savedFloor = estimateFloor(savedCloud);
@@ -380,12 +398,18 @@ export function relocalize(savedCloud, sessionCloud, {
     coarse = searchVolume(savedCloud, sessionCloud, dy);
   }
   const out = [];
-  for (const c of coarse) {
+  // semillas extra (p. ej. "estás en el punto inicial del escaneo"): siempre se refinan e incluyen
+  const seeds = [...extraSeeds.map((e) => ({ ...e, score: 0, extra: e.tag ?? true })), ...coarse];
+  for (const c of seeds) {
     const r = refine([c.yaw, c.tx, c.ty, c.tz]);
     const quality = score(r.yaw, r.t);
     const dup = out.find((o) => Math.hypot(o.t[0] - r.t[0], o.t[2] - r.t[2]) < 0.1 && angDiff(o.yaw, r.yaw) < 3 * DEG);
-    if (dup) { if (quality > dup.quality) Object.assign(dup, { ...r, quality, planScore: c.score }); continue; }
-    out.push({ ...r, quality, planScore: c.score });
+    if (dup) {
+      if (quality > dup.quality) Object.assign(dup, { ...r, quality, planScore: c.score });
+      if (c.extra) dup.tag = c.extra;
+      continue;
+    }
+    out.push({ ...r, quality, planScore: c.score, ...(c.extra ? { tag: c.extra } : {}) });
   }
   // orden final: calidad penalizada por "ver a través" de superficies guardadas
   for (const c of out) {

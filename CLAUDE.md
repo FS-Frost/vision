@@ -37,6 +37,9 @@ Sitio: https://fs-frost.github.io/vision/ (GitHub Pages, publicado por el workfl
   - La confirmación muestra cada candidato como **semáforo**: verde si coincide con la profundidad en vivo (±15 cm, el ruido medido entre sesiones), rojo si la cámara ve a través, gris sin dato. Hay un modo **parpadeo** con colores reales. No se vuelve a la malla azul uniforme: en 3D no permite juzgar la alineación.
   - La altura del suelo se calcula desde la malla, no se confía en `local-floor`.
   - Los frames del barrido se integran tras confirmar, no se descartan.
+  - **Pista de inicio:** cada escaneo nuevo guarda su pose inicial y una foto pequeña. Al continuar, se muestra la foto y la relocalización **siempre** incluye un candidato que supone que la sesión está en el punto inicial. Es una ayuda: nunca reemplaza la búsqueda global.
+  - **Vistas de referencia** (etapa 2, solo si hacen falta): presupuesto máximo de ~3 MB por escaneo.
+- **Captura: profundidad cercana.** La precisión de ARCore cae con la distancia. En `integrate`, el peso por muestra es 1 hasta 1,5 m, baja linealmente hasta 0 a 3 m, y se descarta lo que está más lejos.
   - `scan/reloc.js` no importa nada: si el worker lo importara con un import estático de otro módulo local, se rompería el versionado `?v=`.
 - **IndexedDB:** si cambias los stores, sube `DB_VERSION` en `scan/db.js` y crea los stores que falten en `onupgradeneeded`, sin borrar datos.
 - **No hay Python en esta máquina.** Para scripts usa Node o Bash.
