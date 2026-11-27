@@ -616,7 +616,7 @@ function colorToDataURL(buf, w, h, cross = false) {
 // ---------------------------------------------------------------- anclas
 
 const MAX_ANCHORS = 3;
-const ANCHOR_WARN_M = 0.12; // residuo a partir del cual las anclas "no cuadran"
+const ANCHOR_WARN_M = 0.25; // residuo a partir del cual las anclas "no cuadran" (bueno medido: 12–18 cm; mal marcadas: 80–140 cm)
 
 /**
  * Punto 3D bajo la mirilla. Primero con la profundidad de ARCore (la misma de la malla:
