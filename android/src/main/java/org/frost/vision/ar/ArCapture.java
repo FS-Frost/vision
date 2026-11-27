@@ -120,6 +120,68 @@ public final class ArCapture {
     return out;
   }
 
+  /** Copia de una imagen YUV_420_888 (el Image de ARCore debe cerrarse enseguida). */
+  public static final class Yuv {
+    public int width, height;
+    byte[] y, u, v;
+    int yr, yp, ur, up, vr, vp;
+    /** Intrínsecos de la imagen completa (convención de core/: centro del píxel en i + 0,5). */
+    public float fx, fy, cx, cy;
+
+    /** ARGB submuestreado por s (para Bitmap). */
+    public int[] argb(int s) {
+      int w = width / s, h = height / s, half = s / 2;
+      int[] out = new int[w * h];
+      for (int j = 0; j < h; j++) {
+        int sy = j * s + half;
+        for (int i = 0; i < w; i++) {
+          int sx = i * s + half;
+          int yy = y[sy * yr + sx * yp] & 255;
+          int uu = (u[(sy >> 1) * ur + (sx >> 1) * up] & 255) - 128;
+          int vv = (v[(sy >> 1) * vr + (sx >> 1) * vp] & 255) - 128;
+          int r = Math.max(0, Math.min(255, yy + Math.round(1.402f * vv)));
+          int g = Math.max(0, Math.min(255, yy - Math.round(0.344136f * uu + 0.714136f * vv)));
+          int b = Math.max(0, Math.min(255, yy + Math.round(1.772f * uu)));
+          out[j * w + i] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
+      }
+      return out;
+    }
+  }
+
+  private static byte[] copy(ByteBuffer b) {
+    ByteBuffer d = b.duplicate();
+    d.rewind();
+    byte[] a = new byte[d.remaining()];
+    d.get(a);
+    return a;
+  }
+
+  /** Copia la imagen de CPU a resolución completa (para fotos clave), o null. */
+  public static Yuv copyCameraImage(Frame frame, Camera cam) {
+    Image img = null;
+    try {
+      img = frame.acquireCameraImage();
+      Yuv c = new Yuv();
+      c.width = img.getWidth(); c.height = img.getHeight();
+      Image.Plane[] pl = img.getPlanes();
+      c.y = copy(pl[0].getBuffer()); c.u = copy(pl[1].getBuffer()); c.v = copy(pl[2].getBuffer());
+      c.yr = pl[0].getRowStride(); c.yp = pl[0].getPixelStride();
+      c.ur = pl[1].getRowStride(); c.up = pl[1].getPixelStride();
+      c.vr = pl[2].getRowStride(); c.vp = pl[2].getPixelStride();
+      CameraIntrinsics ii = cam.getImageIntrinsics();
+      int[] dim = ii.getImageDimensions();
+      float[] fl = ii.getFocalLength(), pp = ii.getPrincipalPoint();
+      float kx = c.width / (float) dim[0], ky = c.height / (float) dim[1];
+      c.fx = fl[0] * kx; c.fy = fl[1] * ky; c.cx = (pp[0] + 0.5f) * kx; c.cy = (pp[1] + 0.5f) * ky;
+      return c;
+    } catch (NotYetAvailableException e) {
+      return null;
+    } finally {
+      if (img != null) img.close();
+    }
+  }
+
   /** Coordenadas de la profundidad (píxeles, convención de core/) de un punto de la vista normalizada. */
   public static float[] viewToDepth(Frame frame, float vx, float vy, int w, int h) {
     float[] out = new float[2];

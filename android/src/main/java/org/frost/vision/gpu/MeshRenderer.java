@@ -12,6 +12,7 @@ import org.frost.vision.core.MeshPart;
 import java.nio.FloatBuffer;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
@@ -20,16 +21,18 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * hilo con {@link #enqueue} y se suben a la GPU en {@link #draw} (hilo de render).
  */
 public final class MeshRenderer {
-  public static final int MODE_AR = 0, MODE_COLOR = 1, MODE_SHADED = 2, MODE_SEMAFORO = 3;
+  public static final int MODE_AR = 0, MODE_COLOR = 1, MODE_SHADED = 2, MODE_SEMAFORO = 3, MODE_TEXTURE = 4;
 
   static final class Gpu {
-    int vbo, ibo, count;
+    int vbo, ibo, count, image = -1;
   }
 
   private final Map<Long, Gpu> meshes = new HashMap<>();
   private final ConcurrentLinkedQueue<MeshPart> queue = new ConcurrentLinkedQueue<>();
   private volatile boolean clearRequested;
-  private final int prog, uMvp, uModel, uMode, uAlpha, uLive, uLiveInv, uLiveK, uLiveSize, uTol;
+  private final int prog, uMvp, uModel, uMode, uAlpha, uLive, uLiveInv, uLiveK, uLiveSize, uTol, uTex, uHasTex;
+  private volatile List<android.graphics.Bitmap> pendingImages;
+  private int[] textures = new int[0];
   private int liveTex, liveW, liveH;
   private FloatBuffer liveUp;
   private DepthFrame liveFrame;
@@ -47,6 +50,8 @@ public final class MeshRenderer {
     uLiveK = GLES20.glGetUniformLocation(prog, "uLiveK");
     uLiveSize = GLES20.glGetUniformLocation(prog, "uLiveSize");
     uTol = GLES20.glGetUniformLocation(prog, "uTol");
+    uTex = GLES20.glGetUniformLocation(prog, "uTex");
+    uHasTex = GLES20.glGetUniformLocation(prog, "uHasTex");
   }
 
   /** Encola mallas (cualquier hilo). Una malla vacía borra su supercelda. */
@@ -64,6 +69,11 @@ public final class MeshRenderer {
   public void setLive(DepthFrame f) { pendingLive = f; }
 
   public int meshCount() { return meshes.size(); }
+
+  /** Fotos clave para MODE_TEXTURE, en el orden de MeshPart.image (cualquier hilo). No se reciclan: si el contexto GL se recrea, se vuelven a subir. */
+  public void setImages(List<android.graphics.Bitmap> images) { pendingImages = images; }
+
+  public boolean hasTextures() { return textures.length > 0 || pendingImages != null; }
 
   private void upload() {
     if (clearRequested) {
@@ -86,17 +96,37 @@ public final class MeshRenderer {
         meshes.put(m.key, g);
       }
       int nv = m.vertexCount();
-      float[] inter = new float[nv * 9];
+      float[] inter = new float[nv * 11];
       for (int i = 0; i < nv; i++) {
-        System.arraycopy(m.positions, i * 3, inter, i * 9, 3);
-        System.arraycopy(m.normals, i * 3, inter, i * 9 + 3, 3);
-        System.arraycopy(m.colors, i * 3, inter, i * 9 + 6, 3);
+        System.arraycopy(m.positions, i * 3, inter, i * 11, 3);
+        System.arraycopy(m.normals, i * 3, inter, i * 11 + 3, 3);
+        System.arraycopy(m.colors, i * 3, inter, i * 11 + 6, 3);
+        if (m.textured()) System.arraycopy(m.uvs, i * 2, inter, i * 11 + 9, 2);
       }
+      g.image = m.textured() ? m.image : -1;
       GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, g.vbo);
       GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, inter.length * 4, Gl.floats(inter), GLES20.GL_STATIC_DRAW);
       GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, g.ibo);
       GLES20.glBufferData(GLES20.GL_ELEMENT_ARRAY_BUFFER, m.indices.length * 4, Gl.ints(m.indices), GLES20.GL_STATIC_DRAW);
       g.count = m.indices.length;
+    }
+    List<android.graphics.Bitmap> imgs = pendingImages;
+    if (imgs != null) {
+      pendingImages = null;
+      for (int t : textures) Gl.deleteTexture(t);
+      textures = new int[imgs.size()];
+      for (int i = 0; i < imgs.size(); i++) {
+        android.graphics.Bitmap b = imgs.get(i);
+        if (b == null) continue;
+        textures[i] = Gl.genTexture();
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[i]);
+        android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, b, 0);
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+      }
     }
     DepthFrame lf = pendingLive;
     if (lf != null && lf != liveFrame) {
@@ -155,12 +185,22 @@ public final class MeshRenderer {
     GLES20.glEnableVertexAttribArray(0);
     GLES20.glEnableVertexAttribArray(1);
     GLES20.glEnableVertexAttribArray(2);
+    GLES20.glEnableVertexAttribArray(3);
+    GLES20.glUniform1i(uTex, 1);
     int tris = 0;
     for (Gpu g : meshes.values()) {
       GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, g.vbo);
-      GLES20.glVertexAttribPointer(0, 3, GLES20.GL_FLOAT, false, 36, 0);
-      GLES20.glVertexAttribPointer(1, 3, GLES20.GL_FLOAT, false, 36, 12);
-      GLES20.glVertexAttribPointer(2, 3, GLES20.GL_FLOAT, false, 36, 24);
+      GLES20.glVertexAttribPointer(0, 3, GLES20.GL_FLOAT, false, 44, 0);
+      GLES20.glVertexAttribPointer(1, 3, GLES20.GL_FLOAT, false, 44, 12);
+      GLES20.glVertexAttribPointer(2, 3, GLES20.GL_FLOAT, false, 44, 24);
+      GLES20.glVertexAttribPointer(3, 2, GLES20.GL_FLOAT, false, 44, 36);
+      boolean tex = mode == MODE_TEXTURE && g.image >= 0 && g.image < textures.length && textures[g.image] != 0;
+      GLES20.glUniform1i(uHasTex, tex ? 1 : 0);
+      if (tex) {
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[g.image]);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+      }
       GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, g.ibo);
       GLES20.glDrawElements(GLES20.GL_TRIANGLES, g.count, GLES20.GL_UNSIGNED_INT, 0);
       tris += g.count / 3;
@@ -169,6 +209,7 @@ public final class MeshRenderer {
     GLES20.glDisableVertexAttribArray(0);
     GLES20.glDisableVertexAttribArray(1);
     GLES20.glDisableVertexAttribArray(2);
+    GLES20.glDisableVertexAttribArray(3);
     GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0);
     GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0);
     GLES20.glDisable(GLES20.GL_BLEND);

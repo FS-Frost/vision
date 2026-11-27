@@ -82,7 +82,7 @@ public final class TestsActivity extends Activity {
     }
     Fusion gf = compare("sintética", synth, new Params());
     try {
-      saveAndReload(gf);
+      saveAndReload(gf, synth);
     } catch (Exception e) {
       print("{\"test\":\"guardar\",\"pass\":false,\"error\":\"" + e + "\"}");
     }
@@ -104,7 +104,7 @@ public final class TestsActivity extends Activity {
   }
 
   /** Guarda con el mismo camino que la app, relee de disco y simula una continuación con anclas. */
-  private void saveAndReload(Fusion gf) throws Exception {
+  private void saveAndReload(Fusion gf, List<DepthFrame> synth) throws Exception {
     ScanStore store = new ScanStore(this);
     ScanSaver.Input in = new ScanSaver.Input();
     in.name = "Escena de prueba (sintética)";
@@ -117,6 +117,20 @@ public final class TestsActivity extends Activity {
       a.p = q; a.cam = new float[] {0, 1.3f, 0}; a.camHeight = 1.3f;
       a.dist = (float) Math.sqrt(q[0] * q[0] + (q[1] - 1.3f) * (q[1] - 1.3f) + q[2] * q[2]);
       in.anchors.add(a);
+    }
+    // Fotos clave: una de cada 4 vistas, con el color de la escena como foto (JPEG real).
+    in.keyframes = new ArrayList<>();
+    in.keyframeJpegs = new ArrayList<>();
+    for (int i = 0; i < synth.size(); i += 4) {
+      DepthFrame d = synth.get(i);
+      int[] px = new int[d.colorWidth * d.colorHeight];
+      for (int k = 0; k < px.length; k++) px[k] = 0xFF000000 | ((d.color[k * 3] & 255) << 16) | ((d.color[k * 3 + 1] & 255) << 8) | (d.color[k * 3 + 2] & 255);
+      android.graphics.Bitmap b = android.graphics.Bitmap.createBitmap(px, d.colorWidth, d.colorHeight, android.graphics.Bitmap.Config.ARGB_8888);
+      in.keyframeJpegs.add(ScanStore.jpeg(b, 90));
+      org.frost.vision.core.Texturer.Keyframe k = new org.frost.vision.core.Texturer.Keyframe();
+      k.pose = d.pose; k.depth = d; k.width = d.colorWidth; k.height = d.colorHeight;
+      k.fx = d.fx; k.fy = d.fy; k.cx = d.cx; k.cy = d.cy;
+      in.keyframes.add(k);
     }
     long t0 = System.nanoTime();
     ScanMeta m = ScanSaver.save(store, gf, in);
@@ -141,11 +155,16 @@ public final class TestsActivity extends Activity {
     Reloc.AnchorSolution sol = Reloc.solveAnchors(sv, ss);
     boolean anchorsOk = Math.abs(Mat4.angleDiff(sol.yaw, 0.7)) < 1e-3 && sol.maxResidual < 1e-3;
     int simp = Simplify.triangles(Simplify.toBudget(mesh, m.voxel, tris / 3));
-    boolean pass = tris == m.tris && back.anchors.size() == 3 && Math.abs(back.floorY) < 0.05f
+    List<MeshPart> texParts = org.frost.vision.core.Glb.read(ScanStore.read(store.file(m.id, "textured.glb")));
+    int texTris = 0;
+    for (MeshPart pm : texParts) if (pm.textured()) texTris += pm.triangleCount();
+    List<org.frost.vision.core.Texturer.Keyframe> kfBack = new ArrayList<>();
+    ScanSaver.loadKeyframes(store, m.id, kfBack, new ArrayList<>());
+    boolean pass = texTris > tris * 0.8 && kfBack.size() == in.keyframes.size() && back.keyframes == in.keyframes.size() && tris == m.tris && back.anchors.size() == 3 && Math.abs(back.floorY) < 0.05f
         && Math.abs(reVerts - gfVerts) <= gfVerts * 0.01 && anchorsOk && simp <= tris / 3;
     print(String.format(Locale.US, "{\"test\":\"guardar, releer y continuar\",\"pass\":%b,\"id\":\"%s\",\"tris\":%d,\"saveMs\":%.0f,"
-        + "\"floorY\":%.3f,\"reloadVerts\":%d,\"gpuVerts\":%d,\"anchorYaw\":%.4f,\"anchorResidual\":%.5f,\"simplifiedTris\":%d}",
-        pass, m.id, tris, saveMs, back.floorY, reVerts, gfVerts, sol.yaw, sol.maxResidual, simp));
+        + "\"floorY\":%.3f,\"reloadVerts\":%d,\"gpuVerts\":%d,\"anchorYaw\":%.4f,\"anchorResidual\":%.5f,\"simplifiedTris\":%d,\"texturedTris\":%d,\"keyframes\":%d}",
+        pass, m.id, tris, saveMs, back.floorY, reVerts, gfVerts, sol.yaw, sol.maxResidual, simp, texTris, kfBack.size()));
   }
 
   private Fusion compare(String name, List<DepthFrame> frames, Params params) {

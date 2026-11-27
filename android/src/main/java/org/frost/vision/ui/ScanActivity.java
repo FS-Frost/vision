@@ -52,6 +52,7 @@ import org.frost.vision.core.MeshPart;
 import org.frost.vision.core.Params;
 import org.frost.vision.core.Reloc;
 import org.frost.vision.core.ScanMeta;
+import org.frost.vision.core.Texturer;
 import org.frost.vision.core.Volume;
 import org.frost.vision.gpu.BackgroundRenderer;
 import org.frost.vision.gpu.Gl;
@@ -124,6 +125,14 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
   private volatile double[] liveScores = new double[0];
   private volatile boolean blink;
   private String anchorsNote = "";
+
+  // fotos clave para las texturas (pose en el marco de la sesión)
+  static final int MAX_KEYFRAMES = 60, KEYFRAME_WIDTH = 1280;
+  private final List<Texturer.Keyframe> keyframes = new ArrayList<>();
+  private final List<byte[]> keyframeJpegs = new ArrayList<>();
+  private final java.util.concurrent.ExecutorService kfExec = java.util.concurrent.Executors.newSingleThreadExecutor();
+  private float[] lastKfPose;
+  private long lastKfMs;
 
   // grabación
   private boolean recording;
@@ -325,6 +334,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
   @Override
   protected void onDestroy() {
     super.onDestroy();
+    kfExec.shutdownNow();
     if (worker != null) worker.release();
     if (session != null) session.close();
     session = null;
@@ -436,6 +446,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     Phase ph = phase;
     if (ph == Phase.SCANNING) {
       if (worker.submit(df)) runOnUiThread(() -> coverage.mark(yaw));
+      maybeKeyframe(frame, df, now);
     } else if (ph == Phase.ANCHORS || ph == Phase.SWEEP || ph == Phase.CONFIRM) {
       worker.latest = df;
       if (now - lastSweepMs >= 300) {
@@ -458,6 +469,37 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
       Log.i(TAG, String.format(Locale.US, "profundidad raw %dx%d, válidos %.0f%%, confianza media %.2f, color %dx%d",
           df.width, df.height, 100f * valid / df.depth.length, valid > 0 ? mean / valid : 0, df.colorWidth, df.colorHeight));
     }
+  }
+
+  /**
+   * Foto clave si la cámara se movió > 30 cm o giró > 20° desde la última (máx. una cada 0,7 s y
+   * MAX_KEYFRAMES en total). En el hilo GL solo se copia el YUV; la conversión y el JPEG van aparte.
+   */
+  private void maybeKeyframe(Frame frame, DepthFrame df, long now) {
+    if (now - lastKfMs < 700 || kfExec.isShutdown()) return;
+    synchronized (keyframes) { if (keyframes.size() >= MAX_KEYFRAMES) return; }
+    float[] p = df.pose;
+    if (lastKfPose != null) {
+      float dx = p[12] - lastKfPose[12], dy = p[13] - lastKfPose[13], dz = p[14] - lastKfPose[14];
+      float cos = p[8] * lastKfPose[8] + p[9] * lastKfPose[9] + p[10] * lastKfPose[10];
+      if (dx * dx + dy * dy + dz * dz < 0.09f && cos > 0.94f) return;
+    }
+    ArCapture.Yuv yuv = ArCapture.copyCameraImage(frame, frame.getCamera());
+    if (yuv == null) return;
+    lastKfMs = now;
+    lastKfPose = p.clone();
+    DepthFrame depth = new DepthFrame(df.width, df.height, df.depth, df.confidence, df.fx, df.fy, df.cx, df.cy, df.pose);
+    kfExec.execute(() -> {
+      int s = Math.max(1, (yuv.width + KEYFRAME_WIDTH - 1) / KEYFRAME_WIDTH);
+      int w = yuv.width / s, h = yuv.height / s;
+      Bitmap bmp = Bitmap.createBitmap(yuv.argb(s), w, h, Bitmap.Config.ARGB_8888);
+      byte[] jpg = ScanStore.jpeg(bmp, 85);
+      bmp.recycle();
+      Texturer.Keyframe k = new Texturer.Keyframe();
+      k.pose = depth.pose; k.depth = depth; k.width = w; k.height = h;
+      k.fx = yuv.fx / s; k.fy = yuv.fy / s; k.cx = yuv.cx / s; k.cy = yuv.cy / s;
+      synchronized (keyframes) { keyframes.add(k); keyframeJpegs.add(jpg); }
+    });
   }
 
   /** Suelo según los planos horizontales de ARCore (el más bajo), o NaN. */
@@ -957,6 +999,20 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
           in.anchorJpegs = new ArrayList<>();
           for (Bitmap b : newAnchorPhotos) in.anchorJpegs.add(b != null ? ScanStore.jpeg(b, 85) : null);
         }
+        kfExec.shutdown();
+        kfExec.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+        float[] al = worker.fusion.align;
+        in.keyframes = new ArrayList<>();
+        synchronized (keyframes) {
+          for (Texturer.Keyframe k : keyframes) {
+            Texturer.Keyframe q = new Texturer.Keyframe();
+            q.pose = al != null ? Mat4.mul(al, k.pose) : k.pose; // sesión -> marco del escaneo
+            q.depth = k.depth.withPose(q.pose);
+            q.width = k.width; q.height = k.height; q.fx = k.fx; q.fy = k.fy; q.cx = k.cx; q.cy = k.cy;
+            in.keyframes.add(q);
+          }
+          in.keyframeJpegs = new ArrayList<>(keyframeJpegs);
+        }
         ScanMeta m = ScanSaver.save(store, worker.fusion, in);
         if (m == null) {
           runOnUiThread(() -> { toast("No hay nada escaneado todavía."); phase = Phase.SCANNING; worker.setPaused(false); showScanningBar(); });
@@ -992,6 +1048,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     s.append(String.format(Locale.US, "\n%s %.1f ms · bloques %d · pend %d · tris %d",
         st.gpu ? "GPU" : "CPU", st.integrateMs, st.blocks, st.pending, st.tris));
     if (st.gpu) s.append(String.format(Locale.US, " · pool %d/%d", st.gpuBlocks, st.gpuCapacity));
+    synchronized (keyframes) { s.append(" · fotos ").append(keyframes.size()); }
     if (recording) s.append("\n● grabando");
     String text = s.toString();
     Phase ph = phase;

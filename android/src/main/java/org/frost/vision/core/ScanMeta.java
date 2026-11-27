@@ -29,6 +29,8 @@ public final class ScanMeta {
   /** Altura del suelo en el marco del escaneo (planos de ARCore o malla), NaN si no se conoce. */
   public float floorY = Float.NaN;
   public int verts, tris;
+  /** Fotos clave guardadas (texturas); 0 = sin textured.glb. */
+  public int keyframes;
   public final List<Anchor> anchors = new ArrayList<>();
 
   public String toJson() {
@@ -42,6 +44,7 @@ public final class ScanMeta {
     s.append(",\"hasVolume\":").append(hasVolume);
     s.append(",\"startPose\":").append(arr(startPose));
     s.append(",\"floorY\":").append(Float.isNaN(floorY) ? "null" : Float.toString(floorY));
+    s.append(",\"keyframes\":").append(keyframes);
     s.append(",\"verts\":").append(verts).append(",\"tris\":").append(tris);
     s.append(",\"anchors\":[");
     for (int i = 0; i < anchors.size(); i++) {
@@ -87,6 +90,7 @@ public final class ScanMeta {
     s.floorY = num(m.get("floorY"), Float.NaN);
     s.verts = (int) num(m.get("verts"), 0);
     s.tris = (int) num(m.get("tris"), 0);
+    s.keyframes = (int) num(m.get("keyframes"), 0);
     Object an = m.get("anchors");
     if (an instanceof List) {
       for (Object o : (List<Object>) an) {

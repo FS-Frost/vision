@@ -43,6 +43,7 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
   private GLSurfaceView gl;
   private MeshRenderer renderer;
   private volatile List<MeshPart> meshes;
+  private volatile List<android.graphics.Bitmap> images;
   private TextView info;
   private Button walkBtn, colorBtn;
   private JoystickView joy;
@@ -50,7 +51,10 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
   // cámara (protegida por "this")
   private float[] center = {0, 1, 0};
   private float yaw = 0.6f, pitch = -0.5f, dist = 5f, radius = 3f;
-  private boolean walk, color = true;
+  private boolean walk;
+  /** Modo de dibujo: MeshRenderer.MODE_TEXTURE, MODE_COLOR o MODE_SHADED. */
+  private int drawMode = MeshRenderer.MODE_COLOR;
+  private boolean textured;
   private float px, pz, eyeY = 1.6f, floorY = 0;
   private Collider collider;
   private long lastNs;
@@ -92,7 +96,12 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
 
     LinearLayout bottom = Ui.panel(this);
     walkBtn = Ui.button(this, "Caminar", Ui.BTN, v -> toggleWalk());
-    colorBtn = Ui.button(this, "Sombreado", Ui.BTN, v -> { synchronized (this) { color = !color; } colorBtn.setText(color ? "Sombreado" : "Color"); });
+    textured = store.file(meta.id, "textured.glb").isFile();
+    drawMode = textured ? MeshRenderer.MODE_TEXTURE : MeshRenderer.MODE_COLOR;
+    colorBtn = Ui.button(this, nextModeLabel(), Ui.BTN, v -> {
+      synchronized (this) { drawMode = nextMode(); }
+      colorBtn.setText(nextModeLabel());
+    });
     Button cont = Ui.button(this, "Continuar", Ui.ACCENT, v -> startActivity(new Intent(this, ScanActivity.class).putExtra("continue", meta.id)));
     cont.setEnabled(meta.hasVolume);
     if (!meta.hasVolume) cont.setAlpha(0.4f);
@@ -121,7 +130,17 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
   private void load() {
     new Thread(() -> {
       try {
-        List<MeshPart> parts = store.meshes(meta.id);
+        List<MeshPart> parts;
+        if (textured) {
+          byte[] tg = ScanStore.read(store.file(meta.id, "textured.glb"));
+          parts = org.frost.vision.core.Glb.read(tg);
+          List<android.graphics.Bitmap> bmps = new java.util.ArrayList<>();
+          for (byte[] img : org.frost.vision.core.Glb.readImages(tg)) bmps.add(img == null ? null : android.graphics.BitmapFactory.decodeByteArray(img, 0, img.length));
+          images = bmps;
+          if (renderer != null) renderer.setImages(bmps);
+        } else {
+          parts = store.meshes(meta.id);
+        }
         float[] min = {1e9f, 1e9f, 1e9f}, max = {-1e9f, -1e9f, -1e9f};
         int tris = 0;
         for (MeshPart p : parts) {
@@ -154,6 +173,18 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
         runOnUiThread(() -> info.setText("No se pudo cargar la malla: " + e.getMessage()));
       }
     }).start();
+  }
+
+  /** Ciclo: Textura -> Color -> Sombreado (sin texturas: Color <-> Sombreado). */
+  private int nextMode() {
+    if (drawMode == MeshRenderer.MODE_TEXTURE) return MeshRenderer.MODE_COLOR;
+    if (drawMode == MeshRenderer.MODE_COLOR) return MeshRenderer.MODE_SHADED;
+    return textured ? MeshRenderer.MODE_TEXTURE : MeshRenderer.MODE_COLOR;
+  }
+
+  private String nextModeLabel() {
+    int n = nextMode();
+    return n == MeshRenderer.MODE_TEXTURE ? "Textura" : n == MeshRenderer.MODE_COLOR ? "Color" : "Sombreado";
   }
 
   private void toggleWalk() {
@@ -203,6 +234,7 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
   public void onSurfaceCreated(GL10 unused, EGLConfig config) {
     renderer = new MeshRenderer(getAssets());
     if (meshes != null) renderer.enqueue(meshes);
+    if (images != null) renderer.setImages(images);
     lastNs = System.nanoTime();
   }
 
@@ -220,9 +252,9 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
     GLES20.glClearColor(0.06f, 0.067f, 0.083f, 1);
     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
     float[] view = new float[16], proj = new float[16], vp = new float[16];
-    boolean col;
+    int mode;
     synchronized (this) {
-      col = color;
+      mode = drawMode;
       float cp = (float) Math.cos(pitch), sp = (float) Math.sin(pitch);
       float fx = -(float) Math.sin(yaw) * cp, fz = -(float) Math.cos(yaw) * cp;
       if (walk) {
@@ -243,7 +275,7 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
       }
     }
     Matrix.multiplyMM(vp, 0, proj, 0, view, 0);
-    if (renderer != null) renderer.draw(vp, null, col ? MeshRenderer.MODE_COLOR : MeshRenderer.MODE_SHADED, 1f, 0);
+    if (renderer != null) renderer.draw(vp, null, mode, 1f, 0);
   }
 
   @Override
@@ -278,6 +310,7 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
 
   /** El .glb a exportar: el guardado, o simplificado (Simplify.toBudget) si se eligió. */
   private byte[] glbBytes() throws java.io.IOException {
+    if (!simplified && textured) return ScanStore.read(store.file(meta.id, "textured.glb"));
     byte[] glb = ScanStore.read(store.file(meta.id, "mesh.glb"));
     if (!simplified) return glb;
     List<MeshPart> parts = org.frost.vision.core.Simplify.toBudget(org.frost.vision.core.Glb.read(glb), meta.voxel, BIG_TRIS);

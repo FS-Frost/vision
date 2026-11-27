@@ -40,6 +40,7 @@ public final class TestMain {
     test("simplificación: menos triángulos, misma superficie, sin degenerados", TestMain::simplify);
     test("sugerencia de anclas: esquina buena, pared lisa no", TestMain::anchorHint);
     test("GLB de la web (GLTFExporter de three.js): jerarquía de nodos", TestMain::webGlb);
+    test("texturas: cada triángulo toma su color de la foto correcta; GLB con imágenes", TestMain::textures);
     test("registro de frames: escribir y leer da la misma malla", TestMain::frameLog);
     System.out.println();
     System.out.println("pasaron " + passed + ", fallaron " + failed);
@@ -551,5 +552,58 @@ public final class TestMain {
     check(Math.abs(minX) < 1e-6 && Math.abs(maxX - 2.5f) < 1e-6, "x con la traslación del hijo: " + minX + ".." + maxX);
     check(Math.abs(minY - 0.25f) < 1e-6 && Math.abs(maxY - 1.25f) < 1e-6, "y con la traslación del padre: " + minY + ".." + maxY);
     check(red && green, "colores");
+  }
+
+  static void textures() {
+    Fusion f = new Fusion(new Params());
+    TestScene.scanRoom(f);
+    List<MeshPart> mesh = f.finalMeshes(80, 0.004).meshes;
+    // Fotos clave: las mismas vistas del escaneo (foto = color de la escena, mismos intrínsecos).
+    List<Texturer.Keyframe> kfs = new ArrayList<>();
+    List<DepthFrame> shots = new ArrayList<>();
+    for (double yaw = -1.4; yaw <= 1.41; yaw += 0.4) for (double pitch : new double[] {-0.5, -0.15}) {
+      DepthFrame d = TestScene.room(Mat4.pose(yaw, pitch, 0, 1.3, 0));
+      Texturer.Keyframe k = new Texturer.Keyframe();
+      k.pose = d.pose; k.width = d.colorWidth; k.height = d.colorHeight;
+      k.fx = TestScene.FX; k.fy = TestScene.FY; k.cx = TestScene.CX; k.cy = TestScene.CY; k.depth = d;
+      kfs.add(k); shots.add(d);
+    }
+    List<MeshPart> tex = Texturer.texture(mesh, kfs);
+    check(Simplify.triangles(tex) == Simplify.triangles(mesh), "se conservan los triángulos");
+    int texTris = 0, total = 0, good = 0;
+    for (MeshPart m : tex) {
+      total += m.triangleCount();
+      if (!m.textured()) continue;
+      texTris += m.triangleCount();
+      DepthFrame shot = shots.get(m.image);
+      for (int t = 0; t < m.indices.length; t += 3) {
+        float u = 0, v = 0, r = 0, g = 0, b = 0;
+        for (int q = 0; q < 3; q++) {
+          int vi = m.indices[t + q];
+          u += m.uvs[vi * 2] / 3; v += m.uvs[vi * 2 + 1] / 3;
+          r += m.colors[vi * 3] / 3; g += m.colors[vi * 3 + 1] / 3; b += m.colors[vi * 3 + 2] / 3;
+        }
+        int ci = (int) (u * shot.colorWidth), cj = (int) (v * shot.colorHeight);
+        int o = (cj * shot.colorWidth + ci) * 3;
+        // color de vértice (lineal) -> sRGB para comparar con la foto
+        int er = (int) (Math.pow(r, 1 / 2.2) * 255), eg = (int) (Math.pow(g, 1 / 2.2) * 255), eb = (int) (Math.pow(b, 1 / 2.2) * 255);
+        if (Math.abs((shot.color[o] & 255) - er) < 40 && Math.abs((shot.color[o + 1] & 255) - eg) < 40 && Math.abs((shot.color[o + 2] & 255) - eb) < 40) good++;
+      }
+    }
+    double fracTex = texTris / (double) total, fracGood = good / (double) Math.max(1, texTris);
+    System.out.printf("     texturas: %.0f%% de triángulos con foto, %.1f%% con el color correcto%n", fracTex * 100, fracGood * 100);
+    check(fracTex > 0.8, "pocos triángulos con foto: " + fracTex);
+    check(fracGood > 0.95, "color de la foto incorrecto: " + fracGood);
+    // GLB con imágenes: uvs e índice de imagen sobreviven a escribir y leer.
+    List<byte[]> imgs = new ArrayList<>();
+    for (int i = 0; i < kfs.size(); i++) imgs.add(new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) i, 1, 2});
+    byte[] glb = Glb.write(tex, imgs, "t");
+    List<MeshPart> back = Glb.read(glb);
+    List<byte[]> backImgs = Glb.readImages(glb);
+    check(back.size() == tex.size() && backImgs.size() == imgs.size() && backImgs.get(3)[2] == 3, "partes/imágenes");
+    for (int i = 0; i < tex.size(); i++) {
+      check(back.get(i).image == tex.get(i).image, "imagen de la parte " + i);
+      if (tex.get(i).textured()) check(java.util.Arrays.equals(back.get(i).uvs, tex.get(i).uvs), "uvs");
+    }
   }
 }

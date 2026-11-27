@@ -16,6 +16,14 @@ public final class Glb {
   private Glb() {}
 
   public static byte[] write(List<MeshPart> meshes, String name) {
+    return write(meshes, null, name);
+  }
+
+  /**
+   * Con texturas: las partes con uvs + image usan la foto images.get(image) (JPEG) como textura
+   * sin iluminación y NO llevan COLOR_0 (en glTF el color por vértice multiplica a la textura).
+   */
+  public static byte[] write(List<MeshPart> meshes, List<byte[]> images, String name) {
     StringBuilder nodes = new StringBuilder(), meshesJ = new StringBuilder(), acc = new StringBuilder(), views = new StringBuilder();
     List<byte[]> chunks = new ArrayList<>();
     int offset = 0, view = 0, a = 0, k = 0;
@@ -24,7 +32,8 @@ public final class Glb {
       int nv = m.vertexCount();
       float[] mn = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE}, mx = {-Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
       for (int i = 0; i < nv; i++) for (int c = 0; c < 3; c++) { mn[c] = Math.min(mn[c], m.positions[i * 3 + c]); mx[c] = Math.max(mx[c], m.positions[i * 3 + c]); }
-      byte[][] bufs = {floats(m.positions), floats(m.normals), floats(m.colors), ints(m.indices)};
+      boolean tex = m.textured() && images != null && m.image < images.size();
+      byte[][] bufs = {floats(m.positions), floats(m.normals), floats(tex ? m.uvs : m.colors), ints(m.indices)};
       int[] targets = {34962, 34962, 34962, 34963};
       for (int b = 0; b < 4; b++) {
         if (views.length() > 0) views.append(',');
@@ -36,20 +45,39 @@ public final class Glb {
       acc.append("{\"bufferView\":").append(view).append(",\"componentType\":5126,\"count\":").append(nv).append(",\"type\":\"VEC3\",\"min\":[")
           .append(mn[0]).append(',').append(mn[1]).append(',').append(mn[2]).append("],\"max\":[").append(mx[0]).append(',').append(mx[1]).append(',').append(mx[2]).append("]},");
       acc.append("{\"bufferView\":").append(view + 1).append(",\"componentType\":5126,\"count\":").append(nv).append(",\"type\":\"VEC3\"},");
-      acc.append("{\"bufferView\":").append(view + 2).append(",\"componentType\":5126,\"count\":").append(nv).append(",\"type\":\"VEC3\"},");
+      acc.append("{\"bufferView\":").append(view + 2).append(",\"componentType\":5126,\"count\":").append(nv).append(tex ? ",\"type\":\"VEC2\"}," : ",\"type\":\"VEC3\"},");
       acc.append("{\"bufferView\":").append(view + 3).append(",\"componentType\":5125,\"count\":").append(m.indices.length).append(",\"type\":\"SCALAR\"}");
       if (meshesJ.length() > 0) { meshesJ.append(','); nodes.append(','); }
-      meshesJ.append("{\"primitives\":[{\"attributes\":{\"POSITION\":").append(a).append(",\"NORMAL\":").append(a + 1).append(",\"COLOR_0\":").append(a + 2)
-          .append("},\"indices\":").append(a + 3).append(",\"material\":0}]}");
+      meshesJ.append("{\"primitives\":[{\"attributes\":{\"POSITION\":").append(a).append(",\"NORMAL\":").append(a + 1)
+          .append(tex ? ",\"TEXCOORD_0\":" : ",\"COLOR_0\":").append(a + 2)
+          .append("},\"indices\":").append(a + 3).append(",\"material\":").append(tex ? 1 + m.image : 0).append("}]}");
       nodes.append("{\"mesh\":").append(k).append('}');
       view += 4; a += 4; k++;
     }
+    // Imágenes (JPEG) al final del buffer, alineadas a 4 bytes.
+    StringBuilder mats = new StringBuilder("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true,\"extensions\":{\"KHR_materials_unlit\":{}}}");
+    StringBuilder imgs = new StringBuilder(), texs = new StringBuilder();
+    int nImages = images == null ? 0 : images.size();
+    for (int i = 0; i < nImages; i++) {
+      int pad = (4 - offset % 4) % 4;
+      if (pad > 0) { chunks.add(new byte[pad]); offset += pad; }
+      byte[] img = images.get(i);
+      views.append(views.length() > 0 ? "," : "").append("{\"buffer\":0,\"byteOffset\":").append(offset).append(",\"byteLength\":").append(img.length).append('}');
+      chunks.add(img);
+      offset += img.length;
+      if (i > 0) { imgs.append(','); texs.append(','); }
+      imgs.append("{\"bufferView\":").append(view++).append(",\"mimeType\":\"image/jpeg\"}");
+      texs.append("{\"source\":").append(i).append(",\"sampler\":0}");
+      mats.append(",{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":").append(i)
+          .append("},\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true,\"extensions\":{\"KHR_materials_unlit\":{}}}");
+    }
+    String texJson = nImages == 0 ? "" : ",\"images\":[" + imgs + "],\"textures\":[" + texs + "],\"samplers\":[{\"magFilter\":9729,\"minFilter\":9729,\"wrapS\":33071,\"wrapT\":33071}]";
     StringBuilder nodeList = new StringBuilder();
     for (int i = 0; i < k; i++) { if (i > 0) nodeList.append(','); nodeList.append(i); }
     String json = "{\"asset\":{\"version\":\"2.0\",\"generator\":\"vision-android\"},\"extensionsUsed\":[\"KHR_materials_unlit\"],"
         + "\"scene\":0,\"scenes\":[{\"name\":" + Json.quote(name) + ",\"nodes\":[" + nodeList + "]}],"
         + "\"nodes\":[" + nodes + "],\"meshes\":[" + meshesJ + "],"
-        + "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true,\"extensions\":{\"KHR_materials_unlit\":{}}}],"
+        + "\"materials\":[" + mats + "]" + texJson + ","
         + "\"accessors\":[" + acc + "],\"bufferViews\":[" + views + "],\"buffers\":[{\"byteLength\":" + offset + "}]}";
     byte[] jb = json.getBytes(StandardCharsets.UTF_8);
     int jpad = (4 - jb.length % 4) % 4;
@@ -151,8 +179,48 @@ public final class Glb {
             if (len > 0) { nor[i * 3] = x / len; nor[i * 3 + 1] = y / len; nor[i * 3 + 2] = z / len; }
           }
         }
-        out.add(new MeshPart(key++, pos, nor, col, idx));
+        MeshPart part = new MeshPart(key++, pos, nor, col, idx);
+        if (attrs.containsKey("TEXCOORD_0") && prim.get("material") instanceof Double) {
+          int img = imageOfMaterial(g, ((Double) prim.get("material")).intValue());
+          if (img >= 0) {
+            part.uvs = readFloats(b, binStart, accessors, viewsL, ((Double) attrs.get("TEXCOORD_0")).intValue());
+            part.image = img;
+          }
+        }
+        out.add(part);
       }
+    }
+    return out;
+  }
+
+  /** Imagen de la textura base de un material, o -1. */
+  @SuppressWarnings("unchecked")
+  private static int imageOfMaterial(Map<String, Object> g, int mi) {
+    List<Object> mats = (List<Object>) g.get("materials"), texs = (List<Object>) g.get("textures");
+    if (mats == null || texs == null || mi >= mats.size()) return -1;
+    Map<String, Object> pbr = (Map<String, Object>) ((Map<String, Object>) mats.get(mi)).get("pbrMetallicRoughness");
+    if (pbr == null || !(pbr.get("baseColorTexture") instanceof Map)) return -1;
+    int ti = ((Double) ((Map<String, Object>) pbr.get("baseColorTexture")).get("index")).intValue();
+    Object src = ((Map<String, Object>) texs.get(ti)).get("source");
+    return src instanceof Double ? ((Double) src).intValue() : -1;
+  }
+
+  /** Imágenes incrustadas (bufferView) del .glb, en orden; las externas (uri) quedan null. */
+  @SuppressWarnings("unchecked")
+  public static List<byte[]> readImages(byte[] data) {
+    ByteBuffer b = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+    int jlen = b.getInt(12);
+    Map<String, Object> g = (Map<String, Object>) Json.parse(new String(data, 20, jlen, StandardCharsets.UTF_8));
+    int binStart = 20 + jlen + 8;
+    List<byte[]> out = new ArrayList<>();
+    List<Object> imgs = (List<Object>) g.get("images"), views = (List<Object>) g.get("bufferViews");
+    if (imgs == null) return out;
+    for (Object o : imgs) {
+      Map<String, Object> im = (Map<String, Object>) o;
+      if (!(im.get("bufferView") instanceof Double)) { out.add(null); continue; }
+      Map<String, Object> v = (Map<String, Object>) views.get(((Double) im.get("bufferView")).intValue());
+      int off = binStart + num(v.get("byteOffset")), len = num(v.get("byteLength"));
+      out.add(java.util.Arrays.copyOfRange(data, off, off + len));
     }
     return out;
   }
