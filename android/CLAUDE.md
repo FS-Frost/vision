@@ -18,6 +18,16 @@ Reglas operativas de la app Android nativa de `vision` (rama `android`). El plan
   - Peso por distancia (1 hasta 1,5 m, 0 a 3 m).
   - Las ampliaciones se guardan como escaneo nuevo.
 
+## Arquitectura (decidida al implementar)
+
+- **Hilos:** render en el `GLSurfaceView`; fusión en `ar/FusionWorker`, un hilo con **su propio contexto EGL** (`gpu/EglThread`, pbuffer 1×1). Todo acceso a `Fusion` se hace con `worker.run(...)`. Si un frame llega con el hilo ocupado, se descarta (no hay cola).
+- **GPU integra, CPU malla:** `GpuFusion` integra en un pool de bloques en SSBO (los huecos no se liberan) y `sync()` copia los bloques cambiados al espejo `Fusion.volume`. Surface Nets, guardado, nube y relocalización trabajan sobre el espejo.
+- **Captura (`ar/ArCapture`):** solo se usa la profundidad cuyo timestamp coincide con el del frame de cámara (pose exacta). Pose = `Camera.getPose()` (orientación del sensor, no de la pantalla). Intrínsecos de la **textura** escalados a la profundidad; el color usa los de la **imagen de CPU**. Convención de core/: centro del píxel en i + 0,5, así que `cx = (cx_arcore + 0,5) · escala`.
+- **Orden determinista:** `Integrator.touchedBlocks` devuelve claves ordenadas y `Fusion.cloudFrom` ordena por celda. ICP y puntuaciones son sensibles al orden de suma en coma flotante: no reintroduzcas iteración sobre tablas hash en esos caminos.
+- **Edge-to-edge:** con targetSdk 36 Android dibuja bajo las barras. Los controles van en una capa con `Ui.insets`; la mirilla, no (debe quedar en el centro exacto de la vista GL, que es el punto que se mide).
+- **Almacenamiento:** `filesDir/scans/<id>/{meta.json, mesh.glb, volume.bin, start.jpg, anchorN.jpg}`; grabaciones en `filesDir/recordings/` (`.mp4` de ARCore + `.frames` propio). Compartir sale por `store/ShareProvider` (`cacheDir/share/`).
+- **minSdk 24:** nada de `java.util.Base64`, `String.join` ni otras APIs ≥ 26 (base64 propio en `core/ShareHtml`).
+
 ## Toolchain: tropiezos heredados de `linker`
 
 - `javac` con **`-encoding UTF-8`**, bootclasspath `android.jar` + `core-lambda-stubs.jar` en formato Windows (`cygpath -w`, `;`) y `MSYS2_ARG_CONV_EXCL='*'`.
@@ -38,5 +48,5 @@ Reglas operativas de la app Android nativa de `vision` (rama `android`). El plan
 
 1. `./test.sh`: tests JVM de `core/`.
 2. `./build.sh && ./run.sh`, y `apksigner verify`.
-3. En el g54: captura (`adb exec-out screencap -p`), `logcat` y la pantalla oculta «Pruebas» (GPU contra CPU sobre grabaciones).
+3. En el g54: captura (`adb exec-out screencap -p`), `logcat` (etiquetas `VISION`, `VISION_TEST`, `VISION_DIAG`) y la pantalla «Pruebas» (`./run.sh TestsActivity`): GPU contra CPU sobre la escena sintética y sobre la última grabación `.frames`. Criterio: `pass: true` (≥ 99 % de vértices GPU a < 1 voxel). Las demás Activities no se exportan: se abren tocando con `adb shell input tap` (coordenadas con `uiautomator dump`).
 4. Las grabaciones de prueba no se suben al repo (`adb pull` para analizar).

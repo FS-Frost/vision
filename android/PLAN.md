@@ -1,8 +1,25 @@
 # Vision Android: plan de implementación
 
-**Estado:** plan, sin código todavía. Este documento se revisa antes de escribir código y se actualiza al cerrar cada fase.
+**Estado:** F0–F4 implementadas en código. Falta la validación en el teléfono de todo lo que exige moverse con la cámara (ver la tabla de estado).
 **Rama:** `android` del repo `vision`. La app vive en `android/`, y la web de `main` no se toca.
 **Dispositivo de referencia:** moto g54 5G: Android 15 (API 35), arm64-v8a, GPU PowerVR BXM-8-256 con OpenGL ES 3.2, ARCore 1.57 instalado.
+
+## 0. Estado (2026-11-27)
+
+| Fase | Código | Verificado |
+|---|---|---|
+| F0 Esqueleto y ARCore | Hecho: toolchain, manifest, sesión con raw depth + confianza, cámara de mayor resolución de CPU a 30 fps (1920×1080 en el g54), fondo, HUD, grabar y reproducir | `build.sh` en 0 y `apksigner verify` OK. R1/R2 resueltos: `--extra-packages com.google.ar.core` basta y d8 solo avisa de `androidx.annotation`. La sesión arranca en el g54. **Pendiente:** tracking, ≥ 28 fps con la cámara viendo algo, y la grabación (R7) |
+| F1 Escanear, guardar y ver | Hecho: `GpuFusion` + `integrate.comp`/`gather.comp`, hilo de fusión con contexto EGL propio, malla en vivo, guía de cobertura, `ScanStore`, visor, pantalla «Pruebas» | **GPU contra CPU en el g54: 100 % de los vértices a < 1 voxel** (48 420 contra 48 424) y 100 % de voxels iguales. Integración: **mediana 3,7 ms/frame** (p90 6,2) contando la preparación en CPU; la referencia CPU tarda 8,5 ms. **Pendiente:** escaneo real de 1 min, guardar y reabrir |
+| F2 Continuar | Hecho: pista de inicio, anclas con mirilla de profundidad raw (confianza ≥ 0,5), comprobaciones al marcar, `solveAnchors` + ICP, semáforo con profundidad en vivo, parpadeo, recomendación por coincidencia en vivo, barrido + búsqueda global, se guarda como escaneo nuevo | Tests JVM. **Pendiente:** prueba con anclas en el g54 (criterio: residuos ≤ 18 cm, en vivo ≥ 57 %) |
+| F3 Paseo, compartir, importar | Hecho: paseo con joystick y `Collider`, exportar `.glb` (selector de archivos), compartir `.html` (misma plantilla que la web), importar `.glb`/`.html`, renombrar y borrar | Tests JVM de GLB, `.html` y base64. **Pendiente:** abrir un `.html` compartido en un PC; importar un `.glb` de la web |
+| F4 Mejoras | Hecho: pantalla «Diagnóstico», CI por etiqueta `android-v*` (`.github/workflows/android-apk.yml`), registro de frames propio (`.frames`) | Diagnóstico y CI sin ejecutar todavía. **No hechas:** texturas en alta resolución, simplificación de mallas, sugerencia automática de anclas |
+
+### Desviaciones del plan
+
+- **El mallado es en CPU, no en GPU.** La GPU integra; `gather.comp` copia los bloques cambiados a un espejo CPU cada ~250 ms y Surface Nets (el mismo código que la referencia) malla desde ahí. Motivo: el espejo hace falta igualmente para guardar el volumen, la nube de la relocalización y la limpieza final, y así el mallado es idéntico en ambos caminos. La cola de mallado se mide en el HUD («pend»).
+- **Registro de frames propio** (`core/FrameLog`, `recordings/*.frames`) junto al MP4 de ARCore: es la entrada de la prueba GPU contra CPU sobre datos reales y cubre R7 aunque la reproducción de ARCore no traiga profundidad raw.
+- **El color tiene sus propios intrínsecos** (`DepthFrame.colorK`): la imagen de CPU (16:9 o 4:3) no tiene por qué cubrir el mismo campo que la profundidad.
+- **Relocalización sintética: 17/20 en primer lugar** (la web exige 18). Los 3 fallos son la simetría de 180° de la escena de prueba; la correcta queda siempre entre las 3 primeras (20/20) y la coincidencia en vivo la distingue (100 % frente a 65 %). Las constantes de `Reloc` no se tocaron: están calibradas con datos reales.
 
 ## 1. Objetivo
 
