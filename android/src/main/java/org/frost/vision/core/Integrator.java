@@ -50,6 +50,7 @@ public final class Integrator {
     float[] inv = Mat4.invertRigid(f.pose);
     float voxel = p.voxel, trunc = p.trunc;
     int W = f.width, H = f.height;
+    float[] ck = f.color != null ? f.colorK() : null;
     int updates = 0;
     for (long key : blockKeys) {
       Volume.Block b = vol.getOrCreate(key);
@@ -85,12 +86,14 @@ public final class Integrator {
             float w0 = b.w[li], w1 = w0 + wd;
             b.t[li] = (b.t[li] * w0 + tsdf * wd) / w1;
             b.w[li] = Math.min(w1, p.maxWeight);
-            if (f.color != null && Math.abs(sdf) < 1.5f * voxel) {
-              int ci = Math.min(f.colorWidth - 1, (int) Math.floor(u * f.colorWidth / W));
-              int cj = Math.min(f.colorHeight - 1, (int) Math.floor(v * f.colorHeight / H));
-              int o = (cj * f.colorWidth + ci) * 3;
-              int nr = f.color[o] & 255, ng = f.color[o + 1] & 255, nb = f.color[o + 2] & 255;
-              b.c[li] = blendColor(cpack, nr, ng, nb);
+            if (ck != null && Math.abs(sdf) < 1.5f * voxel) {
+              int ci = (int) Math.floor(ck[0] * cx / z + ck[2]);
+              int cj = (int) Math.floor(ck[3] - ck[1] * cy / z);
+              if (ci >= 0 && cj >= 0 && ci < f.colorWidth && cj < f.colorHeight) {
+                int o = (cj * f.colorWidth + ci) * 3;
+                int nr = f.color[o] & 255, ng = f.color[o + 1] & 255, nb = f.color[o + 2] & 255;
+                b.c[li] = blendColor(cpack, nr, ng, nb);
+              }
             }
             changed = true;
             updates++;

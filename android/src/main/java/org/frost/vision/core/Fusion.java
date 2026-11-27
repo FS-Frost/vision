@@ -42,9 +42,7 @@ public final class Fusion {
   /** Aplica la alineación (si hay) a la pose de un frame de la sesión. */
   public DepthFrame aligned(DepthFrame f) {
     if (align == null) return f;
-    DepthFrame g = new DepthFrame(f.width, f.height, f.depth, f.confidence, f.fx, f.fy, f.cx, f.cy, Mat4.mul(align, f.pose));
-    g.color = f.color; g.colorWidth = f.colorWidth; g.colorHeight = f.colorHeight; g.timestampNs = f.timestampNs;
-    return g;
+    return f.withPose(Mat4.mul(align, f.pose));
   }
 
   /** Integración en CPU (referencia / respaldo). */

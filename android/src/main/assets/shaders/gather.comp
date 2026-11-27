@@ -1,0 +1,27 @@
+#version 310 es
+// Copia bloques del pool de la GPU a un buffer compacto para leerlos en la CPU de una vez
+// (mallado, guardado y nube se hacen en la CPU sobre un espejo del volumen).
+// Disposición de salida por bloque i: [i*1536 + 0..511] tsdf, [+512..1023] peso, [+1024..1535] color.
+precision highp float;
+precision highp int;
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Tsdf { float t[]; };
+layout(std430, binding = 1) readonly buffer Wgt { float w[]; };
+layout(std430, binding = 2) readonly buffer Col { uint c[]; };
+layout(std430, binding = 4) readonly buffer Slots { int slots[]; };
+layout(std430, binding = 5) writeonly buffer Staging { uint outv[]; };
+
+void main() {
+  int i = int(gl_WorkGroupID.x);
+  int slot = slots[i];
+  int lid = int(gl_LocalInvocationID.x);
+  for (int k = 0; k < 8; k++) {
+    int li = lid * 8 + k;
+    int src = slot * 512 + li;
+    int dst = i * 1536 + li;
+    outv[dst] = floatBitsToUint(t[src]);
+    outv[dst + 512] = floatBitsToUint(w[src]);
+    outv[dst + 1024] = c[src];
+  }
+}

@@ -22,6 +22,12 @@ public final class DepthFrame {
   /** Color RGB (3 bytes por píxel), alineado con la profundidad; puede ser null. */
   public byte[] color;
   public int colorWidth, colorHeight;
+  /**
+   * Intrínsecos de la imagen de color. En ARCore la imagen de CPU puede tener otra resolución y
+   * otro campo de visión (4:3) que la de profundidad: el color se mapea con sus propios
+   * intrínsecos. 0 = misma geometría que la profundidad, escalada.
+   */
+  public float colorFx, colorFy, colorCx, colorCy;
   /** Marca de tiempo (ns) opcional. */
   public long timestampNs;
 
@@ -38,6 +44,30 @@ public final class DepthFrame {
   public DepthFrame withColor(byte[] rgb, int w, int h) {
     this.color = rgb; this.colorWidth = w; this.colorHeight = h;
     return this;
+  }
+
+  public DepthFrame withColorIntrinsics(float fx, float fy, float cx, float cy) {
+    this.colorFx = fx; this.colorFy = fy; this.colorCx = cx; this.colorCy = cy;
+    return this;
+  }
+
+  /**
+   * Intrínsecos efectivos del color {fx, fy, cx, cy}: los propios o los de la profundidad escalados.
+   * Píxel de color de un punto de cámara: ci = cfx * x/z + ccx ; cj = ccy - cfy * y/z.
+   */
+  public float[] colorK() {
+    if (colorFx > 0) return new float[] {colorFx, colorFy, colorCx, colorCy};
+    float sx = colorWidth / (float) width, sy = colorHeight / (float) height;
+    return new float[] {fx * sx, fy * sy, cx * sx, cy * sy};
+  }
+
+  /** Copia con otra pose (alineación al continuar); comparte los buffers. */
+  public DepthFrame withPose(float[] newPose) {
+    DepthFrame g = new DepthFrame(width, height, depth, confidence, fx, fy, cx, cy, newPose);
+    g.color = color; g.colorWidth = colorWidth; g.colorHeight = colorHeight;
+    g.colorFx = colorFx; g.colorFy = colorFy; g.colorCx = colorCx; g.colorCy = colorCy;
+    g.timestampNs = timestampNs; g.valid = valid;
+    return g;
   }
 
   /**

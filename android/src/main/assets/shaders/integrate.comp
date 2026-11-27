@@ -1,0 +1,82 @@
+#version 310 es
+// Integración TSDF PROYECTIVA en GPU. Debe dar lo mismo que core/Integrator.java (referencia
+// CPU): misma aritmética, mismo floor, mismo redondeo (+0.5). Un grupo de trabajo por bloque
+// activo (8x8x8 voxels); cada hilo recorre una columna de 8 voxels en z.
+precision highp float;
+precision highp int;
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Tsdf { float t[]; };
+layout(std430, binding = 1) buffer Wgt { float w[]; };
+layout(std430, binding = 2) buffer Col { uint c[]; };
+layout(std430, binding = 3) readonly buffer Active { ivec4 blocks[]; }; // bx, by, bz, slot
+
+uniform highp sampler2D uDepth;   // R32F metros (0 = inválido: sin dato o borde)
+uniform highp sampler2D uConf;    // R32F 0..1
+uniform highp sampler2D uColor;   // RGBA8
+uniform mat4 uInv;                // mundo -> cámara
+uniform vec4 uK;                  // fx, fy, cx, cy de la profundidad
+uniform vec4 uCK;                 // fx, fy, cx, cy del color
+uniform ivec2 uSize;              // tamaño de la profundidad
+uniform ivec2 uColorSize;
+uniform int uHasColor;
+uniform vec4 uP;                  // voxel, trunc, minDepth, maxDepth
+uniform vec4 uP2;                 // nearFull, maxWeight, minConfidence, 0
+
+float depthWeight(float d) {
+  if (d <= uP2.x) return 1.0;
+  if (d >= uP.w) return 0.0;
+  return (uP.w - d) / (uP.w - uP2.x);
+}
+
+void main() {
+  ivec4 b = blocks[gl_WorkGroupID.x];
+  int lid = int(gl_LocalInvocationID.x);
+  int lx = lid & 7;
+  int ly = lid >> 3;
+  for (int lz = 0; lz < 8; lz++) {
+    int li = lx | (ly << 3) | (lz << 6);
+    int gi = b.w * 512 + li;
+    uint cp = c[gi];
+    if ((cp & 0x80000000u) != 0u) continue; // congelado (escaneo original al continuar)
+    vec3 wp = (vec3(float(b.x * 8 + lx), float(b.y * 8 + ly), float(b.z * 8 + lz)) + 0.5) * uP.x;
+    vec4 cc = uInv * vec4(wp, 1.0);
+    float z = -cc.z;
+    if (z < uP.z) continue;
+    float u = uK.x * cc.x / z + uK.z;
+    float v = uK.w - uK.y * cc.y / z;
+    int iu = int(floor(u));
+    int iv = int(floor(v));
+    if (iu < 0 || iv < 0 || iu >= uSize.x || iv >= uSize.y) continue;
+    float d = texelFetch(uDepth, ivec2(iu, iv), 0).r;
+    if (!(d > 0.0)) continue;
+    float conf = texelFetch(uConf, ivec2(iu, iv), 0).r;
+    if (conf < uP2.z || d >= uP.w) continue;
+    float wd = conf * depthWeight(d);
+    if (wd <= 0.0) continue;
+    float sdf = d - z;
+    if (sdf < -uP.y) continue;
+    float tsdf = min(1.0, sdf / uP.y);
+    float w0 = w[gi];
+    float w1 = w0 + wd;
+    t[gi] = (t[gi] * w0 + tsdf * wd) / w1;
+    w[gi] = min(w1, uP2.y);
+    if (uHasColor == 1 && abs(sdf) < 1.5 * uP.x) {
+      int ci = int(floor(uCK.x * cc.x / z + uCK.z));
+      int cj = int(floor(uCK.w - uCK.y * cc.y / z));
+      if (ci >= 0 && cj >= 0 && ci < uColorSize.x && cj < uColorSize.y) {
+        vec4 col = texelFetch(uColor, ivec2(ci, cj), 0);
+        int nr = int(floor(col.r * 255.0 + 0.5));
+        int ng = int(floor(col.g * 255.0 + 0.5));
+        int nb = int(floor(col.b * 255.0 + 0.5));
+        int n = int((cp >> 24u) & 0x7Fu);
+        float a = 1.0 / float(min(n, 15) + 1);
+        int r = int(cp & 255u), g = int((cp >> 8u) & 255u), bl = int((cp >> 16u) & 255u);
+        r += int(floor(float(nr - r) * a + 0.5));
+        g += int(floor(float(ng - g) * a + 0.5));
+        bl += int(floor(float(nb - bl) * a + 0.5));
+        c[gi] = uint(r & 255) | (uint(g & 255) << 8u) | (uint(bl & 255) << 16u) | (uint(min(n + 1, 127)) << 24u);
+      }
+    }
+  }
+}

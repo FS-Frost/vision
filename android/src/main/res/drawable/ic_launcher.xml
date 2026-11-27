@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Icono: cubo en perspectiva (malla) sobre fondo oscuro -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp"
+    android:viewportWidth="48" android:viewportHeight="48">
+  <path android:fillColor="#0F1115" android:pathData="M6,2h36a4,4 0,0 1,4 4v36a4,4 0,0 1,-4 4h-36a4,4 0,0 1,-4 -4v-36a4,4 0,0 1,4 -4z" />
+  <path android:fillColor="#2F6FEB" android:pathData="M24,8 L39,16 L24,24 L9,16 Z" />
+  <path android:fillColor="#1F4FB0" android:pathData="M9,16 L24,24 L24,40 L9,32 Z" />
+  <path android:fillColor="#9CC8FF" android:pathData="M39,16 L39,32 L24,40 L24,24 Z" />
+</vector>

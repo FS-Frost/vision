@@ -36,6 +36,8 @@ public final class TestMain {
     test("colisiones: no se atraviesan paredes y se desliza contra ellas", TestMain::collider);
     test("GLB: escribir y leer conserva vértices, colores e índices", TestMain::glb);
     test("JSON: parseo y escape", TestMain::json);
+    test("metadatos y .html compartido: ida y vuelta", TestMain::metaShare);
+    test("registro de frames: escribir y leer da la misma malla", TestMain::frameLog);
     System.out.println();
     System.out.println("pasaron " + passed + ", fallaron " + failed);
     if (failed > 0) System.exit(1);
@@ -430,5 +432,56 @@ public final class TestMain {
     check("x\"yñ".equals(m.get("b")), "string " + m.get("b"));
     check(Boolean.TRUE.equals(m.get("c")) && m.containsKey("d"), "bool/null");
     check(Json.quote("a\"b\n").equals("\"a\\\"b\\n\""), "quote");
+  }
+
+  static void frameLog() throws Exception {
+    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+    java.io.DataOutputStream out = FrameLog.open(bos);
+    List<DepthFrame> orig = new ArrayList<>();
+    for (int i = 0; i < 6; i++) {
+      DepthFrame f = TestScene.room(Mat4.pose(-0.6 + i * 0.25, -0.2, 0, 1.3, 0));
+      f.timestampNs = i;
+      orig.add(f);
+      FrameLog.write(out, f);
+    }
+    out.flush();
+    FrameLog.Reader r = new FrameLog.Reader(new java.io.ByteArrayInputStream(bos.toByteArray()));
+    Fusion a = new Fusion(new Params()), b = new Fusion(new Params());
+    int n = 0;
+    DepthFrame g;
+    while ((g = r.next()) != null) {
+      DepthFrame f = orig.get(n++);
+      check(g.timestampNs == f.timestampNs && g.width == f.width && (g.color != null) == (f.color != null), "cabecera");
+      for (int i = 0; i < f.depth.length; i++) check(Math.abs(g.depth[i] - f.depth[i]) <= 0.0006f, "profundidad en mm");
+      a.integrateCpu(f); b.integrateCpu(g);
+    }
+    check(n == orig.size(), "frames leídos " + n);
+    int va = a.stats()[3], vb = b.stats()[3];
+    a.allMeshes(); b.allMeshes();
+    va = a.stats()[3]; vb = b.stats()[3];
+    check(va > 1000 && Math.abs(va - vb) < va * 0.01, "vértices " + va + " vs " + vb);
+  }
+
+  static void metaShare() throws Exception {
+    ScanMeta m = new ScanMeta();
+    m.id = "20261127-1200"; m.name = "Salón \"norte\""; m.created = 1795000000123L; m.hasVolume = true;
+    m.startPose = Mat4.pose(0.3, 0, 1, 1.4, 2); m.floorY = -1.35f;
+    ScanMeta.Anchor a = new ScanMeta.Anchor();
+    a.p = new float[] {1, 2, 3}; a.dist = 1.2f; a.camHeight = 1.4f; a.cam = new float[] {0, 1.4f, 0}; a.photo = "anchor0.jpg";
+    m.anchors.add(a);
+    ScanMeta r = ScanMeta.fromJson(m.toJson());
+    check(r.name.equals(m.name) && r.created == m.created && r.hasVolume && !r.imported, "campos");
+    check(Math.abs(r.floorY + 1.35f) < 1e-6 && r.startPose[13] == m.startPose[13], "pose y suelo");
+    check(r.anchors.size() == 1 && r.anchors.get(0).p[2] == 3 && "anchor0.jpg".equals(r.anchors.get(0).photo), "anclas");
+    byte[] bin = new byte[1000];
+    for (int i = 0; i < bin.length; i++) bin[i] = (byte) (i * 37 + 11);
+    for (int len = 997; len <= 1000; len++) {
+      byte[] b = java.util.Arrays.copyOf(bin, len);
+      check(java.util.Arrays.equals(b, ShareHtml.decode(ShareHtml.encode(b))), "base64 " + len);
+      check(ShareHtml.encode(b).replace("\n", "").equals(java.util.Base64.getEncoder().encodeToString(b)), "base64 estándar " + len);
+    }
+    String html = ShareHtml.build("<title>{{TITLE}}</title><script id=\"glb\" type=\"application/octet-stream\">\n{{GLB}}\n</script>", bin, "a<b");
+    check(html.contains("a&lt;b"), "escape");
+    check(java.util.Arrays.equals(bin, ShareHtml.extractGlb(html)), "extraer glb");
   }
 }
