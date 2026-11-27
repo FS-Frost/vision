@@ -23,13 +23,20 @@ Sitio: https://fs-frost.github.io/vision/ (GitHub Pages, publicado por el workfl
   - El worker no ve el import map: hereda la versión por la query de su URL (`self.location.search`) e importa el núcleo dinámicamente. No uses imports estáticos de módulos locales dentro del worker.
   - En código, usa `__BUILD__` solo donde deba reemplazarse: el workflow lo sustituye en todos los archivos (en la documentación es inofensivo).
 - **Caché del navegador al probar por USB:** `Network.setCacheDisabled` no afecta a los módulos que carga el worker. Si hace falta limpiar, usa `Network.clearBrowserCache`.
-- **Continuar escaneos:** la alineación (`Fusion.alignPoints`) es ICP punto-plano de 4 grados de libertad (yaw + traslación; la gravedad es común a ambas sesiones), con varias semillas de yaw y radios decrecientes. El worker solo la acepta si dos soluciones consecutivas coinciden. Nunca sobrescribas el escaneo original con una continuación: si la alineación falla, se pierde.
+- **Continuar escaneos:** relocalización global en `scan/reloc.js` (puro, sin imports). Pasos:
+  1. Planta 2D de las superficies verticales, con el suelo estimado desde cada malla.
+  2. Búsqueda gruesa-a-fina de (yaw, x, z) sobre toda la planta guardada.
+  3. ICP punto-plano de 4 grados de libertad (`Fusion.alignPoints`) sobre las mejores semillas.
+  4. Orden por `Fusion.scorePose` (residuo < 2 cm con normal compatible), penalizado por `visibilityCheck` (la cámara «ve a través» de superficies guardadas). La penalización rompe simetrías como la de 180°.
+
+  Nunca sobrescribas el escaneo original con una continuación: si la alineación falla, se pierde.
 - **Continuar = solo añadir zonas nuevas.** `importVolume` congela los voxels ya conocidos y `integrate` no los toca. Medido en el g54: la profundidad de ARCore no coincide a nivel de cm entre sesiones, y mezclar ambas dejaba ~42 % de superficie reobservada doble (>4 cm), sin arreglo con ninguna alineación rígida. No reintroduzcas la mezcla. Tampoco el refinamiento continuo de la alineación: se probó y solo metía ruido (saltos de 5–20 cm entre segundos). La métrica `rms` de `alignPoints` no distingue soluciones buenas de malas: no la uses como prueba de calidad.
-- **Relocalización global** ("buscar en toda la habitación"): es la etapa previa al ICP que permite continuar desde cualquier punto de la habitación. Reglas decididas:
-  - Barrido guiado obligatorio (10–15 s).
+- **Relocalización global** ("buscar en toda la habitación"): reglas decididas (implementadas en `main.js` + worker, mensajes `reloc-*`):
+  - Barrido guiado obligatorio: entre 6 s (con ≥50 % de direcciones cubiertas) y 15 s.
   - **Toda** alineación al continuar requiere confirmación visual del usuario («Coincide» / «Probar otra»), aunque no haya duda.
   - La altura del suelo se calcula desde la malla, no se confía en `local-floor`.
   - Los frames del barrido se integran tras confirmar, no se descartan.
+  - `scan/reloc.js` no importa nada: si el worker lo importara con un import estático de otro módulo local, se rompería el versionado `?v=`.
 - **IndexedDB:** si cambias los stores, sube `DB_VERSION` en `scan/db.js` y crea los stores que falten en `onupgradeneeded`, sin borrar datos.
 - **No hay Python en esta máquina.** Para scripts usa Node o Bash.
 - **CSS:** cualquier página que use el atributo `hidden` en elementos con `display` propio necesita `[hidden] { display: none !important; }`.
