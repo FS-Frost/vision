@@ -8,7 +8,7 @@ import { WalkControls } from './walk.js';
 import { Collider } from './collider.js';
 import { buildViewerHtml, shareOrDownload, importFile } from './share.js';
 import * as db from './db.js';
-import { liveAgreement, startGuess } from './reloc.js';
+import { liveAgreement, startGuess, solveAnchors } from './reloc.js';
 
 const params = new URLSearchParams(location.search);
 const SEND_INTERVAL_MS = 1000 / (parseFloat(params.get('hz')) || 10);
@@ -39,7 +39,10 @@ const ui = {
   overlay: $('#overlay'), hud: $('#hud'), hint: $('#hint'), pause: $('#btn-pause'), stop: $('#btn-stop'),
   relocBar: $('#reloc-bar'), relocText: $('#reloc-text'), relocOk: $('#btn-reloc-ok'),
   relocOther: $('#btn-reloc-other'), relocBlink: $('#btn-reloc-blink'),
-  startPhotoBox: $('#start-photo-box'), startPhoto: $('#start-photo'), relocRetry: $('#btn-reloc-retry'),
+  startPhotoBox: $('#start-photo-box'), startPhoto: $('#start-photo'),
+  crosshair: $('#crosshair'), anchorBtn: $('#btn-anchor'),
+  anchorPanel: $('#anchor-panel'), anchorPhoto: $('#anchor-photo'), anchorText: $('#anchor-text'),
+  anchorMark: $('#btn-anchor-mark'), anchorUse: $('#btn-anchor-use'), anchorRedo: $('#btn-anchor-redo'), anchorSkip: $('#btn-anchor-skip'), relocRetry: $('#btn-reloc-retry'),
   joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
   walkBar: $('#walk-bar'), walkExit: $('#btn-walk-exit'), collide: $('#btn-collide'),
 };
@@ -228,6 +231,21 @@ function applyMeshes(list, replaceAll = false) {
   state.chunks = chunks.size;
 }
 
+const anchorMarkers = new THREE.Group();
+anchorMarkers.name = 'anclas';
+world.add(anchorMarkers);
+const anchorMarkerMat = new THREE.MeshBasicMaterial({ color: 0xff8a00 });
+const anchorMarkerGeo = new THREE.SphereGeometry(0.035, 16, 12);
+
+function setAnchorMarkers(points) {
+  anchorMarkers.clear();
+  for (const p of points ?? []) {
+    const m = new THREE.Mesh(anchorMarkerGeo, anchorMarkerMat);
+    m.position.set(p[0], p[1], p[2]);
+    anchorMarkers.add(m);
+  }
+}
+
 function clearWorld() {
   for (const { mesh } of chunks.values()) { mesh.geometry.dispose(); world.remove(mesh); }
   chunks.clear();
@@ -341,7 +359,7 @@ async function startScan(continueFrom = null) {
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['depth-sensing'],
-      optionalFeatures: ['local-floor', 'camera-access', 'dom-overlay'],
+      optionalFeatures: ['local-floor', 'camera-access', 'dom-overlay', 'hit-test'],
       domOverlay: { root: ui.overlay },
       depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] },
     });
@@ -376,9 +394,16 @@ async function startScan(continueFrom = null) {
   Object.assign(state, {
     mode: 'scan', paused: false, sent: 0, dropped: 0, colorFrames: 0, fusion: null,
     continuing: !!continueFrom, volume: null,
-    reloc: continueFrom ? newReloc() : null,
+    reloc: continueFrom ? newReloc(continueFrom) : null,
     capture: continueFrom ? null : newCapture(),
+    hitSource: null, hit: null,
   });
+  // anclas: las del escaneo guardado (continuar) o ninguna aún (escaneo nuevo)
+  setAnchorMarkers(continueFrom ? (continueFrom.anchors ?? []).map((a) => a.p) : []);
+  ui.anchorBtn.hidden = !!continueFrom;
+  ui.anchorBtn.textContent = 'Ancla 0/3';
+  ui.anchorBtn.disabled = false;
+  ui.anchorPanel.hidden = true;
   ui.relocBar.hidden = true;
   ui.pause.textContent = 'Pausar';
   ui.sheet.hidden = true;
@@ -390,6 +415,14 @@ async function startScan(continueFrom = null) {
   renderer.xr.setReferenceSpaceType(state.refSpace);
   session.addEventListener('end', onSessionEnd);
   await renderer.xr.setSession(session);
+  // mirilla: rayo desde el centro de la cámara contra las superficies reales (ARCore)
+  if ((session.enabledFeatures ?? []).includes('hit-test')) {
+    try {
+      const viewerSpace = await session.requestReferenceSpace('viewer');
+      state.hitSource = await session.requestHitTestSource({ space: viewerSpace });
+    } catch (err) { logError('hit-test', err); }
+  }
+  if (state.reloc?.phase === 'anchors') updateAnchorPanel();
 }
 
 async function onSessionEnd() {
@@ -432,10 +465,12 @@ async function onSessionEnd() {
       chunks: [...chunks.values()].map((c) => c.data),
       startPose: prev ? prev.startPose : state.capture?.startPose,
       startPhoto: prev ? prev.startPhoto : state.capture?.startPhoto,
+      anchors: prev ? prev.anchors : state.capture?.anchors.filter((a) => a.p),
     });
     state.meta = {
       id, name, createdAt: Date.now(), voxel: state.fusion?.voxel, hasVolume: !!state.volume,
       startPose: prev ? prev.startPose : state.capture?.startPose, startPhoto: prev ? prev.startPhoto : state.capture?.startPhoto,
+      anchors: prev ? prev.anchors : state.capture?.anchors.filter((a) => a.p),
     };
     showViewer(state.meta);
     ui.viewerText.textContent = prev
@@ -470,15 +505,19 @@ function onXRFrame(time, frame) {
   const pose = frame.getViewerPose(renderer.xr.getReferenceSpace());
   if (!pose || pose.emulatedPosition) { state.tracking = 'perdido'; return; }
   state.tracking = 'ok';
+  updateHit(frame);
+  if (state.pendingAnchorPhoto != null) grabAnchorPhoto(pose.views[0]);
   const rl = state.continuing ? state.reloc : null;
+  if (rl && (rl.phase === 'sweep' || rl.phase === 'anchors')) rl.sessionStart ??= Array.from(pose.views[0].transform.matrix);
   if (rl && rl.phase === 'sweep') {
     updateSweepCoverage(pose.transform.orientation);
     rl.sessionStart ??= Array.from(pose.views[0].transform.matrix);
   }
   if (state.capture) updateCaptureCoverage(pose.views[0]);
   if (rl && rl.phase === 'confirm') { confirmFrame(time, frame, pose.views[0]); return; }
-  if (rl && rl.phase !== 'sweep' && rl.phase !== 'done') return; // buscando o integrando
-  const interval = rl && rl.phase === 'sweep' ? RELOC_INTERVAL_MS : SEND_INTERVAL_MS;
+  const collecting = rl && (rl.phase === 'sweep' || rl.phase === 'anchors'); // frames para la sesión provisional
+  if (rl && !collecting && rl.phase !== 'done') return; // buscando o integrando
+  const interval = collecting ? RELOC_INTERVAL_MS : SEND_INTERVAL_MS;
   if (state.paused || time - lastSend < interval) return;
   if (workerBusy) { state.dropped++; return; }
 
@@ -496,8 +535,8 @@ function onXRFrame(time, frame) {
   lastSend = time;
 
   const sweeping = rl && rl.phase === 'sweep';
-  const { msg, transfer } = depthMessage(sweeping ? 'reloc-frame' : 'integrate', frame, view, di);
-  if (!sweeping) state.sent++;
+  const { msg, transfer } = depthMessage(collecting ? 'reloc-frame' : 'integrate', frame, view, di);
+  if (!collecting) state.sent++;
   // tras el frame, ¿toca buscar? (se decide ahora para que 'reloc-solve' vaya justo detrás)
   const solve = sweeping && shouldSolve();
   if (solve) rl.phase = 'solving';
@@ -536,7 +575,7 @@ function sendWithColor(msg, transfer, view) {
 // ---------------------------------------------------------------- captura: cobertura y pista de inicio
 
 function newCapture() {
-  return { bins: new Uint8Array(SWEEP_BINS), coverage: 0, up: false, down: false, level: false, startPose: null, startPhoto: null };
+  return { bins: new Uint8Array(SWEEP_BINS), coverage: 0, up: false, down: false, level: false, startPose: null, startPhoto: null, anchors: [], warnedEnd: false };
 }
 
 /** Cobertura del escaneo nuevo: direcciones horizontales + mirar arriba/abajo. Fija la pose inicial. */
@@ -555,14 +594,105 @@ function updateCaptureCoverage(view) {
 }
 
 /** RGBA (fila 0 = abajo de la vista) -> JPEG pequeño en data URL. */
-function colorToDataURL(buf, w, h) {
+function colorToDataURL(buf, w, h, cross = false) {
   const canvas = document.createElement('canvas');
   canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext('2d');
   const img = ctx.createImageData(w, h);
   for (let y = 0; y < h; y++) img.data.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
   ctx.putImageData(img, 0, 0);
+  if (cross) {
+    ctx.strokeStyle = '#ff8a00'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(w / 2 - 10, h / 2); ctx.lineTo(w / 2 + 10, h / 2);
+    ctx.moveTo(w / 2, h / 2 - 10); ctx.lineTo(w / 2, h / 2 + 10);
+    ctx.stroke();
+  }
   return canvas.toDataURL('image/jpeg', 0.75);
+}
+
+// ---------------------------------------------------------------- anclas
+
+const MAX_ANCHORS = 3;
+const ANCHOR_WARN_M = 0.12; // residuo a partir del cual las anclas "no cuadran"
+
+/** Punto 3D donde el rayo de la mirilla toca una superficie real (o null). */
+function updateHit(frame) {
+  state.hit = null;
+  if (state.hitSource) {
+    const res = frame.getHitTestResults(state.hitSource);
+    const p = res[0]?.getPose(renderer.xr.getReferenceSpace());
+    if (p) state.hit = [p.transform.position.x, p.transform.position.y, p.transform.position.z];
+  }
+  ui.crosshair.classList.toggle('ok', !!state.hit);
+}
+
+function grabAnchorPhoto(view) {
+  const i = state.pendingAnchorPhoto;
+  state.pendingAnchorPhoto = null;
+  let pr = null;
+  try { pr = grabCameraColor(view); } catch (err) { logError('ancla', err); }
+  pr?.then((c) => { state.capture.anchors[i].photo = colorToDataURL(c.buf, c.w, c.h, true); })
+    .catch((err) => logError('ancla', err));
+}
+
+function markCaptureAnchor() {
+  const cap = state.capture;
+  if (!cap) return;
+  if (!state.hit) { flashHint('Apunta la mirilla a una superficie (se pone verde) y vuelve a tocar'); return; }
+  if (cap.anchors.length >= MAX_ANCHORS) return;
+  cap.anchors.push({ p: state.hit, photo: null });
+  state.pendingAnchorPhoto = cap.anchors.length - 1;
+  setAnchorMarkers(cap.anchors.map((a) => a.p));
+  ui.anchorBtn.textContent = `Ancla ${cap.anchors.length}/${MAX_ANCHORS}`;
+  ui.anchorBtn.disabled = cap.anchors.length >= MAX_ANCHORS;
+}
+
+let flashUntil = 0;
+function flashHint(text) {
+  ui.hint.textContent = text;
+  ui.hint.hidden = false;
+  flashUntil = performance.now() + 3000;
+}
+
+function updateAnchorPanel() {
+  const rl = state.reloc;
+  const saved = state.meta?.anchors ?? [];
+  const i = rl.anchorHits.length;
+  const a = saved[i];
+  ui.anchorPanel.hidden = false;
+  if (a?.photo) ui.anchorPhoto.src = a.photo;
+  ui.anchorPhoto.hidden = !a?.photo;
+  ui.anchorText.textContent = a
+    ? `Ancla ${i + 1} de ${saved.length}: apunta la mirilla al punto marcado con la cruz en la foto y toca Marcar`
+    : 'Anclas listas';
+  ui.anchorMark.hidden = !a;
+  ui.anchorUse.hidden = !(rl.anchorHits.length >= 2 && a); // ya hay 2: la tercera es opcional
+  ui.anchorRedo.hidden = rl.anchorHits.length === 0;
+}
+
+function markSessionAnchor() {
+  const rl = state.reloc;
+  if (rl?.phase !== 'anchors') return;
+  if (!state.hit) { flashHint('Apunta la mirilla a una superficie (se pone verde) y vuelve a tocar'); return; }
+  rl.anchorHits.push(state.hit);
+  if (rl.anchorHits.length >= (state.meta?.anchors ?? []).length) solveFromAnchors();
+  else updateAnchorPanel();
+}
+
+function solveFromAnchors() {
+  const rl = state.reloc;
+  const saved = (state.meta?.anchors ?? []).slice(0, rl.anchorHits.length).map((a) => a.p);
+  const sol = solveAnchors(saved, rl.anchorHits);
+  rl.anchorSolution = sol;
+  rl.anchorWarn = sol.maxResidual > ANCHOR_WARN_M
+    ? `las anclas no cuadran (${Math.round(sol.maxResidual * 100)} cm): si no coincide, rehaz las anclas` : null;
+  ui.anchorPanel.hidden = true;
+  rl.phase = 'solving';
+  rl.attempts++;
+  rl.lastSolveAt = performance.now();
+  workerBusy = true;
+  worker.postMessage({ type: 'reloc-solve', anchorGuess: sol });
 }
 
 /** Resumen de una relocalización para diagnóstico por USB (window.vision.lastReloc). */
@@ -571,14 +701,16 @@ function relocSummary(rl) {
     scanId: state.meta?.id, refSpace: state.refSpace, coverage: rl?.coverage, attempts: rl?.attempts,
     result: rl?.result, candidates: rl?.candidates ?? [], chosen: rl?.idx, recommended: rl?.recommended,
     live: (rl?.live ?? []).map((v) => ({ ratio: +v.ratio.toFixed(3), match: v.match, through: v.through })),
+    anchorHits: rl?.anchorHits, anchorSolution: rl?.anchorSolution, savedAnchors: (state.meta?.anchors ?? []).map((a) => a.p),
   };
 }
 
 // ---------------------------------------------------------------- relocalización (continuar)
 
-function newReloc() {
+function newReloc(scan = null) {
+  const withAnchors = (scan?.anchors?.length ?? 0) >= 2;
   return {
-    phase: 'sweep', startedAt: performance.now(), lastSolveAt: 0, attempts: 0, frames: 0,
+    phase: withAnchors ? 'anchors' : 'sweep', anchorHits: [], anchorSolution: null, anchorWarn: null, startedAt: performance.now(), lastSolveAt: 0, attempts: 0, frames: 0,
     bins: new Uint8Array(SWEEP_BINS), coverage: 0, candidates: [], idx: 0, result: null, integrated: 0,
   };
 }
@@ -673,7 +805,9 @@ function updateRelocText() {
   const rl = state.reloc;
   const c = rl.live[rl.idx];
   const pct = c && c.match + c.through > 0 ? `${Math.round(c.ratio * 100)}% coincide` : 'midiendo…';
-  const rec = (rl.recommended === rl.idx ? ' · RECOMENDADO' : '') + (rl.candidates[rl.idx]?.tag === 'inicio' ? ' · punto inicial' : '');
+  const tag = rl.candidates[rl.idx]?.tag;
+  const rec = (rl.recommended === rl.idx ? ' · RECOMENDADO' : '') + (tag ? ` · ${tag === 'inicio' ? 'punto inicial' : tag}` : '') +
+    (rl.anchorWarn ? `\n⚠ ${rl.anchorWarn}` : '');
   ui.relocText.textContent =
     `Posición ${rl.idx + 1} de ${rl.candidates.length}: ${pct}${rec}\n` +
     (rl.blink ? 'Parpadeo: si al aparecer y desaparecer nada salta, coincide.'
@@ -927,6 +1061,7 @@ async function openScan(id) {
     const scan = await db.loadScan(id);
     if (!scan) return;
     applyMeshes(scan.chunks, true);
+    setAnchorMarkers((scan.anchors ?? []).map((a) => a.p));
     state.meta = scan;
     state.hasColor = !!scan.hasColor;
     state.removedTris = 0;
@@ -942,6 +1077,7 @@ async function importFromFile(file) {
   try {
     const r = await importFile(file);
     applyMeshes(r.chunks, true);
+    setAnchorMarkers([]);
     state.hasColor = r.hasColor;
     state.removedTris = 0;
     state.fusion = null;
@@ -967,7 +1103,8 @@ setInterval(() => {
     alignLine = {
       sweep: `barrido: ${Math.round(rl.coverage * 100)}% de giro · ${rl.frames} frames · ${secs}s` +
         (rl.result && !rl.result.ok ? `\nsin coincidencia (${rl.result.reason ?? '?'}): sigue girando` : ''),
-      solving: 'buscando en toda la habitación…',
+      anchors: `anclas: ${rl.anchorHits.length}/${(state.meta?.anchors ?? []).length} marcadas · mirilla ${state.hit ? 'OK' : 'sin superficie'}`,
+      solving: rl.anchorSolution ? 'calculando con las anclas…' : 'buscando en toda la habitación…',
       confirm: `¿coincide? posición ${rl.idx + 1}/${rl.candidates.length}${rl.result ? ` · búsqueda ${rl.result.ms} ms` : ''}`,
       confirming: 'integrando el barrido…',
       done: `alineado ✓ confirmado · solo zonas nuevas · ${rl.integrated} frames del barrido`,
@@ -976,13 +1113,16 @@ setInterval(() => {
   let coverLine = '';
   if (state.capture) {
     const cap = state.capture;
+    coverLine = `anclas ${cap.anchors.length}/${MAX_ANCHORS} (mínimo 2) · mirilla ${state.hit ? 'OK' : 'sin superficie'}\n`;
     const ring = Array.from(cap.bins, (v) => (v ? '■' : '·')).join('');
     const missing = [!cap.up && 'arriba', !cap.down && 'abajo'].filter(Boolean).join(' y ');
-    coverLine = `cobertura ${Math.round(cap.coverage * 100)}% ${ring}${missing ? `\nfalta mirar ${missing}` : ''}`;
+    coverLine += `cobertura ${Math.round(cap.coverage * 100)}% ${ring}${missing ? `\nfalta mirar ${missing}` : ''}`;
   }
   const showPhoto = state.continuing && state.reloc?.phase === 'sweep' && !!state.meta?.startPhoto;
   if (showPhoto && ui.startPhoto.src !== state.meta.startPhoto) ui.startPhoto.src = state.meta.startPhoto;
   ui.startPhotoBox.hidden = !showPhoto;
+  const showCross = !!state.capture || state.reloc?.phase === 'anchors';
+  ui.crosshair.hidden = !showCross;
   ui.hud.textContent = [
     `fps ${state.fps}   tracking ${state.tracking}${state.paused ? '   PAUSA' : ''}`,
     alignLine,
@@ -992,7 +1132,9 @@ setInterval(() => {
     f ? `bloques ${f.blocks}   tri ${f.triangles.toLocaleString('es')}   ${f.memoryMB} MB` : 'bloques -',
     state.errors.length ? `ERROR: ${state.errors.at(-1)}` : '',
   ].filter(Boolean).join('\n');
-  if (state.tracking !== 'ok') {
+  if (performance.now() < flashUntil) {
+    // mensaje puntual (p. ej. mirilla sin superficie): se mantiene unos segundos
+  } else if (state.tracking !== 'ok') {
     ui.hint.hidden = false;
     ui.hint.textContent = 'Tracking perdido: mueve el teléfono despacio y apunta a zonas con textura';
   } else if (state.continuing && state.reloc?.phase === 'sweep') {
@@ -1037,6 +1179,8 @@ ui.relocBlink.addEventListener('click', () => {
 ui.relocRetry.addEventListener('click', () => {
   const rl = state.reloc;
   if (rl?.phase !== 'confirm') return;
+  rl.blink = false;
+  if (rl.anchorSolution) { ui.anchorRedo.click(); return; } // con anclas: volver a marcarlas
   // seguir barriendo (los frames acumulados se conservan) y volver a buscar más tarde
   rl.phase = 'sweep';
   rl.lastSolveAt = performance.now();
@@ -1049,7 +1193,37 @@ ui.pause.addEventListener('click', () => {
   state.paused = !state.paused;
   ui.pause.textContent = state.paused ? 'Reanudar' : 'Pausar';
 });
-ui.stop.addEventListener('click', () => renderer.xr.getSession()?.end());
+ui.stop.addEventListener('click', () => {
+  const cap = state.capture;
+  if (cap && state.mode === 'scan' && cap.anchors.length < 2 && !cap.warnedEnd && state.hitSource) {
+    cap.warnedEnd = true;
+    flashHint('Marca al menos 2 anclas (esquinas, bordes de muebles, enchufes) con la mirilla y «Ancla». Para terminar sin anclas, toca Terminar otra vez');
+    return;
+  }
+  renderer.xr.getSession()?.end();
+});
+ui.anchorBtn.addEventListener('click', markCaptureAnchor);
+ui.anchorMark.addEventListener('click', markSessionAnchor);
+ui.anchorUse.addEventListener('click', () => { if (state.reloc?.phase === 'anchors' && state.reloc.anchorHits.length >= 2) solveFromAnchors(); });
+ui.anchorRedo.addEventListener('click', () => {
+  const rl = state.reloc;
+  if (!rl) return;
+  rl.anchorHits = [];
+  rl.anchorWarn = null;
+  rl.anchorSolution = null;
+  rl.blink = false;
+  rl.phase = 'anchors';
+  ui.relocBar.hidden = true;
+  world.visible = false;
+  updateAnchorPanel();
+});
+ui.anchorSkip.addEventListener('click', () => {
+  const rl = state.reloc;
+  if (rl?.phase !== 'anchors') return;
+  rl.phase = 'sweep'; // búsqueda global de respaldo
+  rl.startedAt = performance.now();
+  ui.anchorPanel.hidden = true;
+});
 ui.exportBtn.addEventListener('click', exportGlb);
 ui.share.addEventListener('click', shareScan);
 ui.homeBtn.addEventListener('click', () => showHome());

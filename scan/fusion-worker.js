@@ -38,6 +38,12 @@ function frameFrom(m) {
   };
 }
 
+/** Giro (yaw) + traslación column-major; misma convención que fusion-core.yawMatrix. */
+function yawMatrixLocal(yaw, tx, ty, tz) {
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return Float64Array.from([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, tx, ty, tz, 1]);
+}
+
 function resetReloc() {
   relocFusion = null;
   relocFrames = [];
@@ -88,10 +94,30 @@ function handle(m) {
 
       case 'reloc-solve': {
         const t0 = performance.now();
-        if (!relocFusion) { self.postMessage({ type: 'reloc-result', ok: false, candidates: [], reason: 'sin barrido' }); break; }
+        if (!relocFusion && !m.anchorGuess) { self.postMessage({ type: 'reloc-result', ok: false, candidates: [], reason: 'sin barrido' }); break; }
+        if (!relocFusion) relocFusion = new Fusion({ voxel: 0.05, minWeight: 1 });
         // nube fresca: entre intentos el barrido sigue sumando frames
         const sc = relocFusion.surfaceCloud(true);
         const step = Math.max(1, Math.floor(relocFrames.length / RELOC_VIS_FRAMES));
+        if (m.anchorGuess) {
+          // anclas marcadas por el usuario: sin búsqueda global; la solución de las anclas y su
+          // afinado con ICP local (si hay geometría suficiente). Decide el usuario con el semáforo.
+          const g = m.anchorGuess;
+          const raw = { yaw: g.yaw, t: [g.tx, g.ty, g.tz], matrix: Array.from(yawMatrixLocal(g.yaw, g.tx, g.ty, g.tz)), tag: 'anclas' };
+          const cands = [raw];
+          if (sc.n >= 100) {
+            const r = fusion.alignPoints(sc.pos, { yaws: [0], initial: [g.yaw, g.tx, g.ty, g.tz], levels: [0.12, 0.08, 0.05], itersPer: 4, minRatio: 0 });
+            cands.push({ yaw: r.yaw, t: r.t, matrix: Array.from(r.matrix), tag: 'anclas + ajuste' });
+          }
+          const visFrames = relocFrames.filter((_, i) => i % step === 0);
+          for (const c of cands) {
+            c.quality = sc.n ? fusion.scorePose(sc.pos, sc.nor, c.yaw, c.t, { resTol: reloc.RELOC_PARAMS.resTol, cosTol: reloc.RELOC_PARAMS.cosTol }) : 0;
+            c.visibility = visFrames.length ? reloc.visibilityCheck(fusion.surfaceCloud(), visFrames, c.matrix, { margin: reloc.RELOC_PARAMS.visMargin }).rate : 0;
+            c.rank = c.quality - reloc.RELOC_PARAMS.visWeight * c.visibility;
+          }
+          self.postMessage({ type: 'reloc-result', ok: true, ambiguous: false, ms: performance.now() - t0, candidates: cands, anchors: true });
+          break;
+        }
         const r = reloc.relocalize(fusion.surfaceCloud(), sc, {
           refine: (init) => fusion.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
           score: (yaw, t) => fusion.scorePose(sc.pos, sc.nor, yaw, t, { resTol: reloc.RELOC_PARAMS.resTol, cosTol: reloc.RELOC_PARAMS.cosTol }),

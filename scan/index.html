@@ -52,6 +52,16 @@
   #overlay .row { pointer-events: auto; justify-content: center; }
   #start-photo-box { align-self: center; background: rgba(0,0,0,.6); border-radius: 10px; padding: 6px; color: #fff; text-align: center; font-size: 12px; }
   #start-photo { display: block; width: 28vw; max-width: 140px; border-radius: 6px; margin: 0 auto 4px; }
+  #crosshair { position: fixed; left: 50%; top: 50%; width: 44px; height: 44px; margin: -22px 0 0 -22px; pointer-events: none;
+    border: 2px solid rgba(255,255,255,.85); border-radius: 50%; box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
+  #crosshair::before, #crosshair::after { content: ''; position: absolute; background: rgba(255,255,255,.9); }
+  #crosshair::before { left: 50%; top: -10px; bottom: -10px; width: 2px; margin-left: -1px; }
+  #crosshair::after { top: 50%; left: -10px; right: -10px; height: 2px; margin-top: -1px; }
+  #crosshair.ok { border-color: #3fb950; }
+  #crosshair.ok::before, #crosshair.ok::after { background: #3fb950; }
+  #anchor-panel { pointer-events: auto; align-self: stretch; background: rgba(0,0,0,.7); border-radius: 12px; padding: 10px; color: #fff; text-align: center; }
+  #anchor-photo { display: block; width: 36vw; max-width: 180px; border-radius: 6px; margin: 0 auto 6px; }
+  #anchor-text { margin-bottom: 8px; }
   #reloc-bar { pointer-events: auto; align-self: stretch; background: rgba(0,0,0,.7); border-radius: 12px; padding: 10px; color: #fff; }
   #reloc-text { margin-bottom: 8px; text-align: center; white-space: pre-line; }
   #hint { align-self: center; background: rgba(0,0,0,.55); border-radius: 999px; padding: 6px 14px; color: #fff; text-align: center; }
@@ -131,11 +141,22 @@
 
 <!-- Overlay durante la sesión AR -->
 <div id="overlay" hidden>
+  <div id="crosshair" hidden></div>
   <div class="hud" id="hud">Iniciando…</div>
   <div id="hint">Mueve el teléfono despacio</div>
   <div id="start-photo-box" hidden>
     <img id="start-photo" alt="Vista al empezar el escaneo original">
     <div>Así se veía al empezar: ponte ahí</div>
+  </div>
+  <div id="anchor-panel" hidden>
+    <img id="anchor-photo" alt="Foto del ancla con una cruz en el punto a marcar">
+    <div id="anchor-text"></div>
+    <div class="row">
+      <button id="btn-anchor-mark">Marcar</button>
+      <button id="btn-anchor-use" class="secondary">Usar estas anclas</button>
+      <button id="btn-anchor-redo" class="secondary">Rehacer</button>
+      <button id="btn-anchor-skip" class="secondary">Buscar sin anclas</button>
+    </div>
   </div>
   <div id="reloc-bar" hidden>
     <div id="reloc-text"></div>
@@ -147,6 +168,7 @@
     </div>
   </div>
   <div class="row">
+    <button id="btn-anchor" class="secondary" hidden>Ancla 0/3</button>
     <button id="btn-pause" class="secondary">Pausar</button>
     <button id="btn-stop" class="danger">Terminar</button>
   </div>

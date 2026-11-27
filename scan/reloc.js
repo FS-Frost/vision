@@ -288,6 +288,40 @@ export function startGuess(savedStartPose, sessionStartPose) {
   return { yaw: Math.atan2(A[8], A[0]), tx: A[12], ty: A[13], tz: A[14], tag: 'inicio' };
 }
 
+/**
+ * Anclas: el usuario marca los mismos puntos físicos (esquinas, bordes) en el escaneo guardado y
+ * en la sesión nueva. Con la gravedad común, 2 puntos bastan para fijar giro + traslación:
+ * Procrustes 2D en el plano del suelo (x, z) y la altura por diferencia de centroides.
+ * @param saved   [[x,y,z], ...] en el marco guardado
+ * @param session [[x,y,z], ...] los mismos puntos en el marco de la sesión
+ * @returns {{ yaw, tx, ty, tz, residuals: number[], maxResidual: number, tag: 'anclas' }}
+ */
+export function solveAnchors(saved, session) {
+  const n = Math.min(saved.length, session.length);
+  if (n < 2) throw new Error('hacen falta al menos 2 anclas');
+  const mean = (pts) => [0, 1, 2].map((a) => pts.slice(0, n).reduce((acc, p) => acc + p[a], 0) / n);
+  const cp = mean(saved), cq = mean(session);
+  let sDot = 0, sCross = 0;
+  for (let i = 0; i < n; i++) {
+    const px = saved[i][0] - cp[0], pz = saved[i][2] - cp[2];
+    const qx = session[i][0] - cq[0], qz = session[i][2] - cq[2];
+    sDot += px * qx + pz * qz;
+    sCross += px * qz - pz * qx;
+  }
+  // misma convención que yawMatrix: x' = c x + s z ; z' = -s x + c z
+  const yaw = Math.atan2(sCross, sDot), c = Math.cos(yaw), s = Math.sin(yaw);
+  const tx = cp[0] - (c * cq[0] + s * cq[2]);
+  const ty = cp[1] - cq[1];
+  const tz = cp[2] - (-s * cq[0] + c * cq[2]);
+  const residuals = [];
+  for (let i = 0; i < n; i++) {
+    const q = session[i];
+    const x = c * q[0] + s * q[2] + tx, y = q[1] + ty, z = -s * q[0] + c * q[2] + tz;
+    residuals.push(Math.hypot(x - saved[i][0], y - saved[i][1], z - saved[i][2]));
+  }
+  return { yaw, tx, ty, tz, residuals, maxResidual: Math.max(...residuals), tag: 'anclas' };
+}
+
 function mul(a, b) {
   const o = new Float64Array(16);
   for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {

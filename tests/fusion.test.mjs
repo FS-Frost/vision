@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Fusion, mul4, invertRigid, yawMatrix, depthWeight } from '../scan/fusion-core.js';
 import { Collider } from '../scan/collider.js';
-import { relocalize, RELOC_PARAMS, liveAgreement, startGuess, estimateFloor } from '../scan/reloc.js';
+import { relocalize, RELOC_PARAMS, liveAgreement, startGuess, estimateFloor, solveAnchors } from '../scan/reloc.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -534,4 +534,26 @@ test('suelo: una superficie a menos de 0.8 m bajo la cámara no se toma como sue
     score: () => 0.5, sessionCamY: 1.25, sessionFloorFallback: 0, savedFloorFallback: 0,
   });
   assert.equal(r.sessionFloor, 0, `suelo de sesión ${r.sessionFloor}`);
+});
+
+test('anclas: 2-3 puntos marcados recuperan giro y traslación; un ancla mal marcada se detecta', () => {
+  const A = yawMatrix(2.3, -0.9, 0.04, 1.6);            // verdad: sesión -> guardado
+  const Ainv = invertRigid(A);
+  const saved = [[0.6, 0.75, -1.4], [-1.45, 1.1, -2.45], [1.95, 0.3, 0.2]];
+  const toSession = (p) => [0, 1, 2].map((r) => Ainv[r] * p[0] + Ainv[4 + r] * p[1] + Ainv[8 + r] * p[2] + Ainv[12 + r]);
+  let seed = 3;
+  const noise = () => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5) * 0.04; // ±2 cm
+  const session = saved.map(toSession).map((q) => q.map((v) => v + noise()));
+  const ang = (a) => Math.abs(Math.atan2(Math.sin(a - 2.3), Math.cos(a - 2.3))) * 180 / Math.PI;
+  for (const n of [2, 3]) {
+    const r = solveAnchors(saved.slice(0, n), session.slice(0, n));
+    assert.ok(ang(r.yaw) < 1.5, `${n} anclas: yaw err ${ang(r.yaw)}°`);
+    assert.ok(Math.hypot(r.tx + 0.9, r.ty - 0.04, r.tz - 1.6) < 0.05, `${n} anclas: t ${[r.tx, r.ty, r.tz]}`);
+    assert.ok(r.maxResidual < 0.05);
+  }
+  // ancla 3 marcada sobre otro punto (40 cm de error): el residuo lo delata
+  const bad = session.slice();
+  bad[2] = bad[2].map((v, i) => v + (i === 0 ? 0.4 : 0));
+  assert.ok(solveAnchors(saved, bad).maxResidual > 0.15);
+  assert.throws(() => solveAnchors(saved.slice(0, 1), session.slice(0, 1)));
 });

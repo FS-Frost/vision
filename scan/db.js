@@ -53,13 +53,15 @@ function summarize(chunks) {
  *           chunks: Array<{key, positions, normals, colors, indices}>, volume?: object, createdAt?: number }} scan
  * @returns {Promise<string>} id
  */
-export async function saveScan({ id, name, voxel, hasColor, chunks, volume, createdAt, startPose, startPhoto }) {
+export async function saveScan({ id, name, voxel, hasColor, chunks, volume, createdAt, startPose, startPhoto, anchors }) {
   const db = await open();
   id = id ?? crypto.randomUUID();
   const meta = {
     id, name, voxel: voxel ?? null, hasColor: !!hasColor, hasVolume: !!volume,
     // pista de inicio: pose de la cámara al empezar (marco del escaneo) y foto pequeña de esa vista
     startPose: startPose ? Array.from(startPose) : null, startPhoto: startPhoto ?? null,
+    // anclas: puntos marcados con la mirilla (marco del escaneo) + foto con cruz de cada uno
+    anchors: (anchors ?? []).map((a) => ({ p: Array.from(a.p), photo: a.photo ?? null })),
     ...summarize(chunks), createdAt: createdAt ?? Date.now(), updatedAt: Date.now(),
   };
   const tx = db.transaction(['meta', 'data', 'volume'], 'readwrite');
