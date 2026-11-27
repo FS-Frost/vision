@@ -239,6 +239,7 @@ export class Fusion {
             blocks.set(bkey, b);
           }
           const li = (ix & 7) | ((iy & 7) << 3) | ((iz & 7) << 6);
+          if (b.frozen && b.frozen[li]) continue; // voxel del escaneo original: no se toca
           let tsdf = -s / trunc;
           if (tsdf > 1) tsdf = 1; else if (tsdf < -1) tsdf = -1;
           const w0 = b.w[li], w1 = w0 + 1;
@@ -388,10 +389,13 @@ export class Fusion {
   }
 
   /**
-   * Carga un volumen exportado. Los pesos se limitan para que las observaciones
-   * nuevas puedan corregir lo guardado.
+   * Carga un volumen exportado.
+   * Con `freeze` (por defecto), los voxels ya conocidos (peso >= minWeight) quedan
+   * congelados: `integrate` no los modifica y lo nuevo solo rellena espacio desconocido.
+   * La profundidad de ARCore no coincide a nivel de cm entre sesiones; mezclar ambas
+   * produce superficies dobles (medido en el g54), así que al continuar no se mezclan.
    */
-  importVolume(v, { maxWeight = 10 } = {}) {
+  importVolume(v, { freeze = true, maxWeight = 255 } = {}) {
     if (Math.abs(v.voxel - this.voxel) > 1e-6) throw new Error(`voxel distinto: ${v.voxel} != ${this.voxel}`);
     for (let i = 0; i < v.keys.length; i++) {
       const o = i * BLOCK3;
@@ -399,10 +403,12 @@ export class Fusion {
         key: v.keys[i], mask: 1 << 13,
         t: new Float32Array(BLOCK3), w: new Float32Array(BLOCK3),
         c: v.c.slice(o * 3, (o + BLOCK3) * 3), cw: v.cw.slice(o, o + BLOCK3),
+        frozen: freeze ? new Uint8Array(BLOCK3) : null,
       };
       for (let j = 0; j < BLOCK3; j++) {
         b.t[j] = v.t[o + j] / 32767;
         b.w[j] = Math.min(maxWeight, v.w[o + j]);
+        if (freeze && b.w[j] >= this.minWeight) b.frozen[j] = 1;
       }
       this.blocks.set(b.key, b);
       this.touched.push(b);
@@ -412,32 +418,12 @@ export class Fusion {
 
   // ------------------------------------------------------------ alineación entre sesiones
 
-  /** Fija la alineación sesión -> mundo guardado. `params` = { yaw, t } (para seguir refinándola). */
-  setAlign(m, params = null) {
-    this.align = m ? Float64Array.from(m) : null;
-    this.alignParams = m ? params : null;
-  }
-
   /**
-   * Seguimiento de la alineación: ARCore reajusta su mapa durante la sesión, así que una
-   * alineación calculada al principio deriva. Refina `align` con puntos recientes de la
-   * sesión contra la malla original (la nube objetivo cacheada al alinear por primera vez).
-   * Solo acepta pasos pequeños; si los puntos ven zona nueva (poca coincidencia), no cambia nada.
+   * Fija la alineación sesión -> mundo guardado. Se calcula una vez al empezar:
+   * refinarla durante la sesión (seguimiento) se probó en el g54 y solo añadía ruido
+   * (saltos de 5–20 cm entre refinamientos consecutivos con el mismo error medio).
    */
-  trackAlign(points, { maxStepT = 0.1, maxStepYaw = 0.05 } = {}) {
-    const p = this.alignParams;
-    if (!p) return { updated: false, reason: 'sin alineación' };
-    const r = this.alignPoints(points, {
-      yaws: [0], initial: [p.yaw, ...p.t], levels: [0.12, 0.08, 0.05], itersPer: 3, minRatio: 0.35, maxRms: 0.025,
-    });
-    const dT = Math.hypot(r.t[0] - p.t[0], r.t[1] - p.t[1], r.t[2] - p.t[2]);
-    const dYaw = r.yaw - p.yaw;
-    if (!r.ok || dT > maxStepT || Math.abs(dYaw) > maxStepYaw) {
-      return { updated: false, dT, dYaw, inlierRatio: r.inlierRatio, rms: r.rms };
-    }
-    this.setAlign(r.matrix, { yaw: r.yaw, t: r.t });
-    return { updated: true, matrix: r.matrix, yaw: r.yaw, t: r.t, dT, dYaw, inlierRatio: r.inlierRatio, rms: r.rms };
-  }
+  setAlign(m) { this.align = m ? Float64Array.from(m) : null; }
 
   /** Puntos 3D (en el marco de la sesión, sin `align`) de un mapa de profundidad, submuestreado. */
   samplePoints(f, stride = 4) {

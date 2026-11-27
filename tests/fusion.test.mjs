@@ -340,36 +340,35 @@ test('alineación: refinar desde un candidato converge con una sola semilla', ()
   assert.ok(Math.hypot(r.t[0] + 0.08, r.t[1], r.t[2] - 0.12) < 0.03, `t ${r.t}`);
 });
 
-test('seguimiento: corrige la deriva de la sesión después de alinear', () => {
-  const saved = new Fusion({ voxel: 0.04 });
+test('continuar: lo ya escaneado no cambia aunque la alineación tenga 5 cm de error', () => {
+  const saved = new Fusion({ voxel: 0.03 });
   scanRoom(saved);
-  const cont = new Fusion({ voxel: 0.04 });
-  cont.importVolume(saved.exportVolume());
-  const views = [[0.2, -0.35], [-0.4, -0.3], [0.6, -0.4], [-0.8, -0.25]];
-  const pointsFor = (A) => {
-    const Ainv = invertRigid(A), pts = [];
-    for (const [yaw, pitch] of views) {
+  const vol = saved.exportVolume();
+  const key = (p, i) => `${Math.round(p[i] * 1e4)},${Math.round(p[i + 1] * 1e4)},${Math.round(p[i + 2] * 1e4)}`;
+  const ref = new Fusion({ voxel: 0.03 });
+  ref.importVolume(vol);
+  const origSet = new Set();
+  for (const m of ref.finalMeshes().meshes) for (let i = 0; i < m.positions.length; i += 3) origSet.add(key(m.positions, i));
+
+  const run = (opts) => {
+    const cont = new Fusion({ voxel: 0.03 });
+    cont.importVolume(vol, opts);
+    const Atrue = yawMatrix(0.1, 0.05, 0, -0.1);
+    cont.setAlign(yawMatrix(0.1, 0.10, 0, -0.1)); // estimación con 5 cm de error en x
+    const Ainv = invertRigid(Atrue);
+    for (const [yaw, pitch] of [[0, -0.3], [0.4, -0.35], [-0.4, -0.3]]) {
       const Mw = pose(yaw, pitch, 0, 1.3, 0);
-      pts.push(...cont.samplePoints(frameOf(roomDepth(Mw), mul4(Ainv, Mw))));
+      for (let k = 0; k < 4; k++) cont.integrate(frameOf(roomDepth(Mw), mul4(Ainv, Mw)));
     }
-    return Float32Array.from(pts);
+    const after = new Set();
+    for (const m of cont.finalMeshes().meshes) for (let i = 0; i < m.positions.length; i += 3) after.add(key(m.positions, i));
+    let kept = 0;
+    for (const k of origSet) if (after.has(k)) kept++;
+    return kept / origSet.size;
   };
-  // alineación inicial correcta
-  const A0 = yawMatrix(0.1, 0.05, 0.02, -0.1);
-  const r0 = cont.alignPoints(pointsFor(A0));
-  assert.ok(r0.ok);
-  cont.setAlign(r0.matrix, { yaw: r0.yaw, t: r0.t });
-  // ARCore deriva: la relación sesión -> mundo cambia 6 cm y 1.5°
-  const A1 = yawMatrix(0.1 + 0.026, 0.05 + 0.05, 0.02, -0.1 - 0.035);
-  const tr = cont.trackAlign(pointsFor(A1));
-  assert.ok(tr.updated, `no actualizó: ${JSON.stringify(tr)}`);
-  assert.ok(Math.abs(cont.alignParams.yaw - 0.126) < 0.012, `yaw ${cont.alignParams.yaw}`);
-  const t = cont.alignParams.t;
-  assert.ok(Math.hypot(t[0] - 0.1, t[1] - 0.02, t[2] + 0.135) < 0.025, `t ${t}`);
-  // puntos de una zona sin relación con la malla guardada: no debe moverse
-  const before = [...cont.alignParams.t];
-  const junk = new Float32Array(3000).map((_, i) => (i % 3 === 1 ? 5 : 8) + (i % 7) * 0.1);
-  const tj = cont.trackAlign(junk);
-  assert.equal(tj.updated, false);
-  assert.deepEqual(cont.alignParams.t, before);
+  const frozen = run({ freeze: true });
+  const mixed = run({ freeze: false, maxWeight: 10 }); // comportamiento anterior (control)
+  console.log(`vértices originales intactos: congelado ${(frozen * 100).toFixed(1)}%, mezclado ${(mixed * 100).toFixed(1)}%`);
+  assert.ok(frozen > 0.97, `congelado debería conservar el original: ${frozen}`);
+  assert.ok(mixed < frozen - 0.1, `el control debería alterar el original: ${mixed}`);
 });

@@ -15,13 +15,14 @@ Prototipo funcional:
 - Visor orbital y paseo en primera persona (joystick virtual) con colisiones.
 - Guardado automático en IndexedDB, exportación `.glb` e importación de `.glb`/`.html`.
 - Compartir como `.html` autocontenido (visor three.js + modelo en base64), que se abre en cualquier navegador.
-- Continuar un escaneo guardado: se guarda el volumen TSDF y la sesión nueva se alinea con la malla guardada. La ampliación se guarda como escaneo nuevo y el original se conserva.
+- Continuar un escaneo guardado: se guarda el volumen TSDF, la sesión nueva se alinea con la malla guardada y **solo añade zonas nuevas**; lo ya escaneado no se modifica. La ampliación se guarda como escaneo nuevo y el original se conserva.
 - Calidad: voxel de 3 cm, filtro de ruido, cierre de huecos pequeños y limpieza de fragmentos.
 
 Limitaciones conocidas:
 
 - Continuar exige empezar cerca del punto de inicio del escaneo original (unos 50 cm y 40°), porque la alineación no hace búsqueda global.
-- Las superficies lisas sin textura (techo, paredes blancas) dan profundidad poco fiable y pueden generar capas duplicadas.
+- Las superficies lisas sin textura (techo, paredes blancas) dan profundidad poco fiable.
+- La profundidad de ARCore no coincide a nivel de cm entre sesiones. Por eso una continuación no corrige lo ya escaneado, y en los bordes entre zona vieja y nueva puede quedar un escalón de pocos cm.
 
 Ideas siguientes: texturas en lugar de color por vértice, relocalización global para continuar desde cualquier punto y simplificación de mallas grandes.
 
