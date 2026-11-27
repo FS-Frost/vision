@@ -231,7 +231,7 @@ export function searchVolume(savedCloud, sessionCloud, dy, opts = {}) {
   const maxCandidates = opts.maxCandidates ?? 8;
   if (savedCloud.n < 100 || sessionCloud.n < 100) return [];
   const coarse = scoreVolume(savedCloud, 0.1, 0.15, 0.4);
-  const qc = subsample3(sessionCloud, 300);
+  const qc = subsample3(sessionCloud, 200);
   const step = 0.2, yawStep = (opts.yawStepDeg ?? 5) * DEG;
   const all = [];
   for (let yaw = 0; yaw < 2 * Math.PI - 1e-9; yaw += yawStep) {
@@ -250,11 +250,11 @@ export function searchVolume(savedCloud, sessionCloud, dy, opts = {}) {
     all.push(...best);
   }
   all.sort((a, b) => b.score - a.score);
-  const seeds = nms(all, 0.5, 20 * DEG, maxCandidates * 2);
+  const seeds = nms(all, 0.5, 20 * DEG, maxCandidates + 2);
 
   // fino: ±0.2 m cada 5 cm, ±6° cada 1.5°, altura ±6 cm
   const fine = scoreVolume(savedCloud, 0.05, 0.07, 0.2);
-  const qf = subsample3(sessionCloud, 600);
+  const qf = subsample3(sessionCloud, 400);
   const refined = seeds.map((sd) => {
     let best = { ...sd, ty: dy, score: -1 };
     for (let da = -6; da <= 6; da += 1.5) {
@@ -373,7 +373,7 @@ export function relocalize(savedCloud, sessionCloud, {
   const ambiguous = !!(best && second && second.rank >= 0.9 * best.rank &&
     (Math.hypot(second.t[0] - best.t[0], second.t[2] - best.t[2]) > 0.3 || angDiff(second.yaw, best.yaw) > 15 * DEG));
   return {
-    ok: !!best && best.quality >= minQuality && best.rank > 0,
+    ok: !!best && best.quality >= minQuality, // el rank solo ordena; decide el usuario
     ambiguous, candidates: out, savedFloor, sessionFloor,
     reason: best ? (best.quality < minQuality ? 'coincidencia insuficiente' : undefined) : 'sin candidatos',
   };
