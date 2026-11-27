@@ -40,7 +40,7 @@ const ui = {
   relocBar: $('#reloc-bar'), relocText: $('#reloc-text'), relocOk: $('#btn-reloc-ok'),
   relocOther: $('#btn-reloc-other'), relocBlink: $('#btn-reloc-blink'),
   startPhotoBox: $('#start-photo-box'), startPhoto: $('#start-photo'),
-  crosshair: $('#crosshair'), anchorBtn: $('#btn-anchor'),
+  crosshair: $('#crosshair'), crosshairDist: $('#crosshair-dist'), anchorBtn: $('#btn-anchor'),
   anchorPanel: $('#anchor-panel'), anchorPhoto: $('#anchor-photo'), anchorText: $('#anchor-text'),
   anchorMark: $('#btn-anchor-mark'), anchorUse: $('#btn-anchor-use'), anchorRedo: $('#btn-anchor-redo'), anchorSkip: $('#btn-anchor-skip'), relocRetry: $('#btn-reloc-retry'),
   joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
@@ -505,7 +505,7 @@ function onXRFrame(time, frame) {
   const pose = frame.getViewerPose(renderer.xr.getReferenceSpace());
   if (!pose || pose.emulatedPosition) { state.tracking = 'perdido'; return; }
   state.tracking = 'ok';
-  updateHit(frame);
+  updateCrosshair(frame, pose.views[0]);
   if (state.pendingAnchorPhoto != null) grabAnchorPhoto(pose.views[0]);
   const rl = state.continuing ? state.reloc : null;
   if (rl && (rl.phase === 'sweep' || rl.phase === 'anchors')) rl.sessionStart ??= Array.from(pose.views[0].transform.matrix);
@@ -616,15 +616,49 @@ function colorToDataURL(buf, w, h, cross = false) {
 const MAX_ANCHORS = 3;
 const ANCHOR_WARN_M = 0.12; // residuo a partir del cual las anclas "no cuadran"
 
-/** Punto 3D donde el rayo de la mirilla toca una superficie real (o null). */
-function updateHit(frame) {
+/**
+ * Punto 3D bajo la mirilla. Primero con la profundidad de ARCore (la misma de la malla:
+ * mediana de muestras alrededor del centro), que funciona sobre cualquier superficie.
+ * El hit-test de WebXR queda de respaldo: choca con PLANOS detectados y, si el mueble aún no
+ * es un plano, el rayo lo atraviesa y marca el suelo varios metros detrás (medido en el g54).
+ */
+function updateCrosshair(frame, view) {
   state.hit = null;
-  if (state.hitSource) {
+  state.hitDist = null;
+  state.hitSourceKind = null;
+  if (!ui.crosshair || ui.crosshair.hidden) return;
+  let di = null;
+  try { di = (frame.getDepthInformation ?? frame.getDepthInfo).call(frame, view); } catch { di = null; }
+  if (di?.getDepthInMeters) {
+    const samples = [];
+    for (const dx of [-0.012, 0, 0.012]) for (const dy of [-0.012, 0, 0.012]) {
+      try { const d = di.getDepthInMeters(0.5 + dx, 0.5 + dy); if (d > 0.15) samples.push(d); } catch { /* fuera del buffer */ }
+    }
+    if (samples.length >= 5) {
+      samples.sort((a, b) => a - b);
+      const d = samples[Math.floor(samples.length / 2)];
+      if (d <= 3.5) {
+        // centro de la vista: x_ndc = y_ndc = 0 -> punto en cámara (d·P8/P0, d·P9/P5, -d)
+        const P = view.projectionMatrix, M = view.transform.matrix;
+        const xc = (d * P[8]) / P[0], yc = (d * P[9]) / P[5], zc = -d;
+        state.hit = [0, 1, 2].map((r) => M[r] * xc + M[4 + r] * yc + M[8 + r] * zc + M[12 + r]);
+        state.hitDist = d;
+        state.hitSourceKind = 'profundidad';
+      }
+    }
+  }
+  if (!state.hit && state.hitSource) {
     const res = frame.getHitTestResults(state.hitSource);
-    const p = res[0]?.getPose(renderer.xr.getReferenceSpace());
-    if (p) state.hit = [p.transform.position.x, p.transform.position.y, p.transform.position.z];
+    const pz = res[0]?.getPose(renderer.xr.getReferenceSpace());
+    if (pz) {
+      const t = pz.transform.position, c = view.transform.position;
+      state.hit = [t.x, t.y, t.z];
+      state.hitDist = Math.hypot(t.x - c.x, t.y - c.y, t.z - c.z);
+      state.hitSourceKind = 'plano';
+    }
   }
   ui.crosshair.classList.toggle('ok', !!state.hit);
+  ui.crosshairDist.textContent = state.hitDist ? `${state.hitDist.toFixed(2).replace('.', ',')} m` : '';
 }
 
 function grabAnchorPhoto(view) {
@@ -671,10 +705,38 @@ function updateAnchorPanel() {
   ui.anchorRedo.hidden = rl.anchorHits.length === 0;
 }
 
+const ANCHOR_HEIGHT_TOL = 0.25; // m: el suelo es común (local-floor), la altura debe parecerse
+const ANCHOR_DIST_TOL = 0.2;    // m: las distancias entre anclas deben conservarse
+
+/** Problemas de un ancla recién apuntada frente a las guardadas (vacío si cuadra). */
+function anchorIssues(hit, i) {
+  const rl = state.reloc;
+  const saved = (state.meta?.anchors ?? []).map((a) => a.p);
+  const issues = [];
+  if (state.refSpace === 'local-floor' && Math.abs(hit[1] - saved[i][1]) > ANCHOR_HEIGHT_TOL) {
+    issues.push(`está a otra altura (${Math.round((hit[1] - saved[i][1]) * 100)} cm)`);
+  }
+  rl.anchorHits.forEach((h, j) => {
+    const dNow = Math.hypot(hit[0] - h[0], hit[1] - h[1], hit[2] - h[2]);
+    const dSaved = Math.hypot(saved[i][0] - saved[j][0], saved[i][1] - saved[j][1], saved[i][2] - saved[j][2]);
+    if (Math.abs(dNow - dSaved) > ANCHOR_DIST_TOL) issues.push(`la distancia al ancla ${j + 1} no cuadra (${Math.round(Math.abs(dNow - dSaved) * 100)} cm)`);
+  });
+  return issues;
+}
+
 function markSessionAnchor() {
   const rl = state.reloc;
   if (rl?.phase !== 'anchors') return;
   if (!state.hit) { flashHint('Apunta la mirilla a una superficie (se pone verde) y vuelve a tocar'); return; }
+  const i = rl.anchorHits.length;
+  const issues = anchorIssues(state.hit, i);
+  const now = performance.now();
+  if (issues.length && !(rl.overrideIdx === i && now - rl.overrideAt < 5000)) {
+    rl.overrideIdx = i; rl.overrideAt = now;
+    flashHint(`Ancla ${i + 1}: ${issues.join('; ')}. ¿Apuntaste al punto de la foto? Corrige y vuelve a marcar, o toca Marcar otra vez para aceptarla.`);
+    return;
+  }
+  rl.overrideIdx = null;
   rl.anchorHits.push(state.hit);
   if (rl.anchorHits.length >= (state.meta?.anchors ?? []).length) solveFromAnchors();
   else updateAnchorPanel();
@@ -1103,7 +1165,7 @@ setInterval(() => {
     alignLine = {
       sweep: `barrido: ${Math.round(rl.coverage * 100)}% de giro · ${rl.frames} frames · ${secs}s` +
         (rl.result && !rl.result.ok ? `\nsin coincidencia (${rl.result.reason ?? '?'}): sigue girando` : ''),
-      anchors: `anclas: ${rl.anchorHits.length}/${(state.meta?.anchors ?? []).length} marcadas · mirilla ${state.hit ? 'OK' : 'sin superficie'}`,
+      anchors: `anclas: ${rl.anchorHits.length}/${(state.meta?.anchors ?? []).length} marcadas · mirilla ${state.hit ? `${state.hitDist.toFixed(2)} m (${state.hitSourceKind})` : 'sin superficie'}`,
       solving: rl.anchorSolution ? 'calculando con las anclas…' : 'buscando en toda la habitación…',
       confirm: `¿coincide? posición ${rl.idx + 1}/${rl.candidates.length}${rl.result ? ` · búsqueda ${rl.result.ms} ms` : ''}`,
       confirming: 'integrando el barrido…',
@@ -1113,7 +1175,7 @@ setInterval(() => {
   let coverLine = '';
   if (state.capture) {
     const cap = state.capture;
-    coverLine = `anclas ${cap.anchors.length}/${MAX_ANCHORS} (mínimo 2) · mirilla ${state.hit ? 'OK' : 'sin superficie'}\n`;
+    coverLine = `anclas ${cap.anchors.length}/${MAX_ANCHORS} (mínimo 2) · mirilla ${state.hit ? `${state.hitDist.toFixed(2)} m (${state.hitSourceKind})` : 'sin superficie'}\n`;
     const ring = Array.from(cap.bins, (v) => (v ? '■' : '·')).join('');
     const missing = [!cap.up && 'arriba', !cap.down && 'abajo'].filter(Boolean).join(' y ');
     coverLine += `cobertura ${Math.round(cap.coverage * 100)}% ${ring}${missing ? `\nfalta mirar ${missing}` : ''}`;
@@ -1123,6 +1185,7 @@ setInterval(() => {
   ui.startPhotoBox.hidden = !showPhoto;
   const showCross = !!state.capture || state.reloc?.phase === 'anchors';
   ui.crosshair.hidden = !showCross;
+  ui.crosshairDist.hidden = !showCross;
   ui.hud.textContent = [
     `fps ${state.fps}   tracking ${state.tracking}${state.paused ? '   PAUSA' : ''}`,
     alignLine,
