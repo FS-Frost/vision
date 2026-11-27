@@ -1,0 +1,3 @@
+# app Android (rama android): dependencias vendorizadas y salidas del build
+android/third_party/
+android/build/
