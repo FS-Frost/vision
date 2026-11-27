@@ -8,6 +8,7 @@ import { WalkControls } from './walk.js';
 import { Collider } from './collider.js';
 import { buildViewerHtml, shareOrDownload, importFile } from './share.js';
 import * as db from './db.js';
+import { liveAgreement } from './reloc.js';
 
 const params = new URLSearchParams(location.search);
 const SEND_INTERVAL_MS = 1000 / (parseFloat(params.get('hz')) || 10);
@@ -18,6 +19,10 @@ const SWEEP_MAX_MS = 15000;        // buscar igualmente pasado este tiempo
 const SWEEP_COVERAGE = 0.5;        // fracción de direcciones cubiertas (bins de 15°) para buscar antes
 const RESOLVE_EVERY_MS = 5000;     // si no encontró, reintentar tras este tiempo de barrido extra
 const SWEEP_BINS = 24;
+const LIVE_TOL = 0.15;             // m: coincidencia en vivo (ruido de ARCore entre sesiones)
+const LIVE_EVERY_MS = 200;         // evaluar todos los candidatos contra la profundidad en vivo
+const RECOMMEND_AFTER_MS = 2000;   // recomendar tras este tiempo de evaluación
+const BLINK_MS = 500;
 const COLOR_TOP_DOWN = params.get('colorTopDown') === '1';
 const COLOR_WIDTH = 120;   // ancho de la imagen de color leída de la GPU
 const EYE_HEIGHT = 1.5;    // m sobre el suelo en modo paseo (máximo)
@@ -33,7 +38,7 @@ const ui = {
   exportBtn: $('#btn-export'), homeBtn: $('#btn-home'), newBtn: $('#btn-new'),
   overlay: $('#overlay'), hud: $('#hud'), hint: $('#hint'), pause: $('#btn-pause'), stop: $('#btn-stop'),
   relocBar: $('#reloc-bar'), relocText: $('#reloc-text'), relocOk: $('#btn-reloc-ok'),
-  relocOther: $('#btn-reloc-other'), relocRetry: $('#btn-reloc-retry'),
+  relocOther: $('#btn-reloc-other'), relocBlink: $('#btn-reloc-blink'), relocRetry: $('#btn-reloc-retry'),
   joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
   walkBar: $('#walk-bar'), walkExit: $('#btn-walk-exit'), collide: $('#btn-collide'),
 };
@@ -102,6 +107,90 @@ const materials = {
   shade: new THREE.MeshStandardMaterial({ color: 0xd0d4dc, roughness: 0.9, side: THREE.DoubleSide }),
 };
 let currentMaterial = materials.ar;
+
+// Semáforo de confirmación: cada vértice de la malla guardada se compara en la GPU con la
+// profundidad que mide la cámara AHORA. Verde = coincide (±LIVE_TOL), rojo = la cámara ve a
+// través (la superficie no está ahí), gris = sin dato o tapada por algo más cercano.
+const liveDepth = {
+  texture: null, width: 0, height: 0, data: null, valid: false,
+  uniforms: {
+    uDepth: { value: null },
+    uCamFromSession: { value: new THREE.Matrix4() },
+    uProj: { value: new THREE.Vector4(1, 1, 0, 0) },      // P0, P5, P8, P9
+    uNinv: { value: new THREE.Vector4(1, 0, 0, 1) },      // inversa 2D de normViewFromNormDepth (a, b, c, d)
+    uNoff: { value: new THREE.Vector2(0, 0) },            // traslación (N12, N13)
+    uTol: { value: LIVE_TOL },
+    uValid: { value: 0 },
+  },
+};
+materials.semaforo = new THREE.ShaderMaterial({
+  uniforms: liveDepth.uniforms,
+  transparent: true,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+  vertexShader: `
+    uniform sampler2D uDepth;
+    uniform mat4 uCamFromSession;
+    uniform vec4 uProj;
+    uniform vec4 uNinv;
+    uniform vec2 uNoff;
+    uniform float uTol;
+    uniform float uValid;
+    varying vec4 vColor;
+    void main() {
+      vec4 sessionPos = modelMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * viewMatrix * sessionPos;
+      vColor = vec4(0.6, 0.6, 0.6, 0.25);                 // gris: sin dato
+      if (uValid < 0.5) return;
+      vec4 c = uCamFromSession * sessionPos;
+      float dist = -c.z;
+      if (dist < 0.3 || dist > 4.0) return;
+      float xn = uProj.x * c.x / dist - uProj.z;
+      float yn = uProj.y * c.y / dist - uProj.w;
+      if (abs(xn) > 1.0 || abs(yn) > 1.0) return;
+      float u = (xn + 1.0) * 0.5 - uNoff.x;
+      float v = (1.0 - yn) * 0.5 - uNoff.y;
+      vec2 uvd = vec2(uNinv.x * u + uNinv.y * v, uNinv.z * u + uNinv.w * v);
+      if (uvd.x < 0.0 || uvd.y < 0.0 || uvd.x > 1.0 || uvd.y > 1.0) return;
+      float measured = texture2D(uDepth, uvd).r;
+      if (measured <= 0.0) return;
+      if (abs(measured - dist) <= uTol) vColor = vec4(0.15, 0.9, 0.3, 0.7);   // coincide
+      else if (measured > dist) vColor = vec4(0.95, 0.2, 0.2, 0.7);           // ve a través
+    }`,
+  fragmentShader: `
+    varying vec4 vColor;
+    void main() { gl_FragColor = vColor; }`,
+});
+
+/** Copia la profundidad del frame (en metros) a la textura y a un frame para liveAgreement. */
+function updateLiveDepth(view, di) {
+  const W = di.width, H = di.height, k = di.rawValueToMeters;
+  if (!liveDepth.texture || liveDepth.width !== W || liveDepth.height !== H) {
+    liveDepth.texture?.dispose();
+    liveDepth.data = new Float32Array(W * H);
+    liveDepth.texture = new THREE.DataTexture(liveDepth.data, W, H, THREE.RedFormat, THREE.FloatType);
+    liveDepth.texture.minFilter = liveDepth.texture.magFilter = THREE.NearestFilter;
+    liveDepth.width = W; liveDepth.height = H;
+    liveDepth.uniforms.uDepth.value = liveDepth.texture;
+  }
+  const raw = di.data;
+  const src = frameDepthIsFloat ? new Float32Array(raw) : new Uint16Array(raw);
+  for (let i = 0; i < W * H; i++) liveDepth.data[i] = src[i] * k;
+  liveDepth.texture.needsUpdate = true;
+  const N = di.normDepthBufferFromNormView.inverse.matrix;
+  const det = N[0] * N[5] - N[4] * N[1];
+  liveDepth.uniforms.uNinv.value.set(N[5] / det, -N[4] / det, -N[1] / det, N[0] / det);
+  liveDepth.uniforms.uNoff.value.set(N[12], N[13]);
+  const P = view.projectionMatrix;
+  liveDepth.uniforms.uProj.value.set(P[0], P[5], P[8], P[9]);
+  liveDepth.uniforms.uCamFromSession.value.fromArray(view.transform.inverse.matrix);
+  liveDepth.uniforms.uValid.value = 1;
+  liveDepth.frame = {
+    depth: liveDepth.data, width: W, height: H, rawToMeters: 1,
+    normViewFromNormDepth: Array.from(N), projection: Array.from(P), viewMatrix: Array.from(view.transform.matrix),
+  };
+}
+let frameDepthIsFloat = false;
 
 // `world` contiene la malla en el marco del escaneo guardado. Al continuar un escaneo,
 // su matriz es la inversa de la alineación (marco guardado -> marco de la sesión AR).
@@ -378,7 +467,8 @@ function onXRFrame(time, frame) {
   state.tracking = 'ok';
   const rl = state.continuing ? state.reloc : null;
   if (rl && rl.phase === 'sweep') updateSweepCoverage(pose.transform.orientation);
-  if (rl && rl.phase !== 'sweep' && rl.phase !== 'done') return; // buscando o esperando confirmación
+  if (rl && rl.phase === 'confirm') { confirmFrame(time, frame, pose.views[0]); return; }
+  if (rl && rl.phase !== 'sweep' && rl.phase !== 'done') return; // buscando o integrando
   const interval = rl && rl.phase === 'sweep' ? RELOC_INTERVAL_MS : SEND_INTERVAL_MS;
   if (state.paused || time - lastSend < interval) return;
   if (workerBusy) { state.dropped++; return; }
@@ -468,7 +558,68 @@ function onRelocResult(m) {
   }
   rl.phase = 'confirm';
   rl.candidates = m.candidates;
+  rl.liveCloud ??= savedCloudForLive();
+  rl.live = m.candidates.map(() => ({ match: 0, through: 0, ratio: 0, now: 0 }));
+  rl.recommended = null;
+  rl.liveStart = null;
+  rl.blink = false;
   showCandidate(0);
+}
+
+/** Nube de la malla guardada (submuestreada) para evaluar candidatos en vivo en el hilo principal. */
+function savedCloudForLive(max = 3000) {
+  let total = 0;
+  for (const { data } of chunks.values()) total += data.positions.length / 3;
+  const step = Math.max(1, Math.floor(total / max));
+  const pos = [];
+  let k = 0;
+  for (const { data } of chunks.values()) {
+    for (let i = 0; i < data.positions.length; i += 3, k++) {
+      if (k % step === 0) pos.push(data.positions[i], data.positions[i + 1], data.positions[i + 2]);
+    }
+  }
+  return { pos: Float32Array.from(pos), n: pos.length / 3 };
+}
+
+/** Un frame de la fase de confirmación: profundidad en vivo, evaluación, recomendación, parpadeo. */
+function confirmFrame(time, frame, view) {
+  const rl = state.reloc;
+  let di = null;
+  try { di = (frame.getDepthInformation ?? frame.getDepthInfo).call(frame, view); } catch (err) { logError('depth', err); }
+  if (di) {
+    frameDepthIsFloat = frame.session.depthDataFormat === 'float32';
+    updateLiveDepth(view, di);
+  }
+  // evaluar todos los candidatos contra el frame actual y acumular
+  if (liveDepth.frame && time - (rl.lastLive ?? 0) >= LIVE_EVERY_MS) {
+    rl.lastLive = time;
+    rl.liveStart ??= time;
+    rl.candidates.forEach((c, i) => {
+      const a = liveAgreement(rl.liveCloud, liveDepth.frame, c.matrix, { tol: LIVE_TOL });
+      const acc = rl.live[i];
+      acc.match += a.match; acc.through += a.through;
+      acc.ratio = acc.match / Math.max(1, acc.match + acc.through);
+      acc.now = a.ratio;
+    });
+    if (rl.recommended == null && time - rl.liveStart >= RECOMMEND_AFTER_MS) {
+      rl.recommended = rl.live.reduce((best, v, i) => (v.ratio > rl.live[best].ratio ? i : best), 0);
+      if (rl.recommended !== rl.idx) showCandidate(rl.recommended); // una sola vez: ir al recomendado
+    }
+    updateRelocText();
+  }
+  // parpadeo: la malla con colores reales aparece y desaparece
+  if (rl.blink) world.visible = Math.floor(time / BLINK_MS) % 2 === 0;
+}
+
+function updateRelocText() {
+  const rl = state.reloc;
+  const c = rl.live[rl.idx];
+  const pct = c && c.match + c.through > 0 ? `${Math.round(c.ratio * 100)}% coincide` : 'midiendo…';
+  const rec = rl.recommended === rl.idx ? ' · RECOMENDADO' : '';
+  ui.relocText.textContent =
+    `Posición ${rl.idx + 1} de ${rl.candidates.length}: ${pct}${rec}\n` +
+    (rl.blink ? 'Parpadeo: si al aparecer y desaparecer nada salta, coincide.'
+              : 'Verde = coincide con lo que ves · rojo = no está ahí. ¿Casi todo verde?');
 }
 
 function showCandidate(i) {
@@ -478,12 +629,18 @@ function showCandidate(i) {
   // la malla guardada está en el marco guardado; para verla en la sesión: inversa
   setWorldMatrix(new THREE.Matrix4().fromArray(c.matrix).invert().toArray());
   world.visible = true;
-  ui.relocText.textContent =
-    `¿La malla azul coincide con la realidad? Posición ${i + 1} de ${rl.candidates.length}` +
-    ` · coincidencia ${Math.round(c.quality * 100)}%` +
-    (rl.result?.ambiguous ? ' · hay otra posición parecida: compruébalo bien' : '');
+  setMaterial(rl.blink ? materials.color : materials.semaforo);
   ui.relocOther.hidden = rl.candidates.length < 2;
+  ui.relocBlink.textContent = rl.blink ? 'Semáforo' : 'Parpadeo';
   ui.relocBar.hidden = false;
+  updateRelocText();
+}
+
+/** Siguiente candidato en orden de coincidencia en vivo (el recomendado primero). */
+function nextCandidate() {
+  const rl = state.reloc;
+  const order = rl.candidates.map((_, i) => i).sort((a, b) => (rl.live[b].ratio ?? 0) - (rl.live[a].ratio ?? 0));
+  showCandidate(order[(order.indexOf(rl.idx) + 1) % order.length]);
 }
 
 const clock = new THREE.Clock();
@@ -786,13 +943,22 @@ ui.relocOk.addEventListener('click', () => {
   const rl = state.reloc;
   if (!rl || rl.phase !== 'confirm') return;
   rl.phase = 'confirming';
+  rl.blink = false;
+  world.visible = true;
+  setMaterial(materials.ar);
   ui.relocBar.hidden = true;
   workerBusy = true;
   worker.postMessage({ type: 'reloc-confirm', matrix: rl.candidates[rl.idx].matrix });
 });
 ui.relocOther.addEventListener('click', () => {
   const rl = state.reloc;
-  if (rl?.phase === 'confirm') showCandidate((rl.idx + 1) % rl.candidates.length);
+  if (rl?.phase === 'confirm') nextCandidate();
+});
+ui.relocBlink.addEventListener('click', () => {
+  const rl = state.reloc;
+  if (rl?.phase !== 'confirm') return;
+  rl.blink = !rl.blink;
+  showCandidate(rl.idx);
 });
 ui.relocRetry.addEventListener('click', () => {
   const rl = state.reloc;
@@ -800,6 +966,8 @@ ui.relocRetry.addEventListener('click', () => {
   // seguir barriendo (los frames acumulados se conservan) y volver a buscar más tarde
   rl.phase = 'sweep';
   rl.lastSolveAt = performance.now();
+  rl.blink = false;
+  setMaterial(materials.ar);
   ui.relocBar.hidden = true;
   world.visible = false;
 });

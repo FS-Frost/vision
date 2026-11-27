@@ -51,7 +51,7 @@
     font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre; color: #fff; }
   #overlay .row { pointer-events: auto; justify-content: center; }
   #reloc-bar { pointer-events: auto; align-self: stretch; background: rgba(0,0,0,.7); border-radius: 12px; padding: 10px; color: #fff; }
-  #reloc-text { margin-bottom: 8px; text-align: center; }
+  #reloc-text { margin-bottom: 8px; text-align: center; white-space: pre-line; }
   #hint { align-self: center; background: rgba(0,0,0,.55); border-radius: 999px; padding: 6px 14px; color: #fff; text-align: center; }
 
   /* Joystick del modo paseo */
@@ -136,6 +136,7 @@
     <div class="row">
       <button id="btn-reloc-ok">Coincide</button>
       <button id="btn-reloc-other" class="secondary">Probar otra</button>
+      <button id="btn-reloc-blink" class="secondary">Parpadeo</button>
       <button id="btn-reloc-retry" class="secondary">Seguir buscando</button>
     </div>
   </div>

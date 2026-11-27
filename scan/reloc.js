@@ -296,9 +296,36 @@ function invRigid(m) {
  * @returns {{ violations, support, checked, rate }} rate = violations / (violations + support)
  */
 export function visibilityCheck(savedCloud, frames, matrix, { maxPoints = 2500, margin = 0.1 } = {}) {
+  let violations = 0, support = 0, checked = 0;
+  forEachProjected(savedCloud, frames, matrix, maxPoints, (dist, measured) => {
+    checked++;
+    if (measured > dist + margin) violations++;
+    else if (Math.abs(measured - dist) <= margin) support++;
+  });
+  return { violations, support, checked, rate: violations / Math.max(1, violations + support) };
+}
+
+/**
+ * Coincidencia en vivo de un candidato con UN frame actual (confirmación visual):
+ * - match: la cámara mide la superficie guardada donde debe (± tol)
+ * - through: la cámara ve a través de ella (mide más lejos)
+ * - occluded: algo más cercano la tapa (no cuenta)
+ * @returns {{ match, through, occluded, ratio }} ratio = match / (match + through)
+ */
+export function liveAgreement(savedCloud, frame, matrix, { tol = 0.15, maxPoints = 2500 } = {}) {
+  let match = 0, through = 0, occluded = 0;
+  forEachProjected(savedCloud, [frame], matrix, maxPoints, (dist, measured) => {
+    if (Math.abs(measured - dist) <= tol) match++;
+    else if (measured > dist) through++;
+    else occluded++;
+  });
+  return { match, through, occluded, ratio: match / Math.max(1, match + through) };
+}
+
+/** Proyecta la superficie guardada (con la pose `matrix`) en cada frame y llama cb(dist, medida). */
+function forEachProjected(savedCloud, frames, matrix, maxPoints, cb) {
   const Ainv = invRigid(matrix); // guardado -> sesión
   const step = Math.max(1, Math.floor(savedCloud.n / maxPoints));
-  let violations = 0, support = 0, checked = 0;
   for (const f of frames) {
     const C = invRigid(f.viewMatrix); // sesión -> cámara
     const P = f.projection, N = f.normViewFromNormDepth;
@@ -325,12 +352,9 @@ export function visibilityCheck(savedCloud, frames, matrix, { maxPoints = 2500, 
       if (pi < 0 || pj < 0 || pi >= W || pj >= H) continue;
       const measured = f.depth[pj * W + pi] * k;
       if (!(measured > 0)) continue;
-      checked++;
-      if (measured > dist + margin) violations++;
-      else if (Math.abs(measured - dist) <= margin) support++;
+      cb(dist, measured);
     }
   }
-  return { violations, support, checked, rate: violations / Math.max(1, violations + support) };
 }
 
 /**

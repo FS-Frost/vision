@@ -33,7 +33,8 @@ Sitio: https://fs-frost.github.io/vision/ (GitHub Pages, publicado por el workfl
 - **Continuar = solo añadir zonas nuevas.** `importVolume` congela los voxels ya conocidos y `integrate` no los toca. Medido en el g54: la profundidad de ARCore no coincide a nivel de cm entre sesiones, y mezclar ambas dejaba ~42 % de superficie reobservada doble (>4 cm), sin arreglo con ninguna alineación rígida. No reintroduzcas la mezcla. Tampoco el refinamiento continuo de la alineación: se probó y solo metía ruido (saltos de 5–20 cm entre segundos). La métrica `rms` de `alignPoints` no distingue soluciones buenas de malas: no la uses como prueba de calidad.
 - **Relocalización global** ("buscar en toda la habitación"): reglas decididas (implementadas en `main.js` + worker, mensajes `reloc-*`):
   - Barrido guiado obligatorio: entre 6 s (con ≥50 % de direcciones cubiertas) y 15 s.
-  - **Toda** alineación al continuar requiere confirmación visual del usuario («Coincide» / «Probar otra»), aunque no haya duda.
+  - **Toda** alineación al continuar requiere confirmación visual del usuario («Coincide» / «Probar otra»), aunque no haya duda. La app puede **ordenar y recomendar** candidatos por coincidencia en vivo, pero nunca aceptar sola.
+  - La confirmación muestra cada candidato como **semáforo**: verde si coincide con la profundidad en vivo (±15 cm, el ruido medido entre sesiones), rojo si la cámara ve a través, gris sin dato. Hay un modo **parpadeo** con colores reales. No se vuelve a la malla azul uniforme: en 3D no permite juzgar la alineación.
   - La altura del suelo se calcula desde la malla, no se confía en `local-floor`.
   - Los frames del barrido se integran tras confirmar, no se descartan.
   - `scan/reloc.js` no importa nada: si el worker lo importara con un import estático de otro módulo local, se rompería el versionado `?v=`.

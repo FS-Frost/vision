@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Fusion, mul4, invertRigid, yawMatrix } from '../scan/fusion-core.js';
 import { Collider } from '../scan/collider.js';
-import { relocalize, RELOC_PARAMS } from '../scan/reloc.js';
+import { relocalize, RELOC_PARAMS, liveAgreement } from '../scan/reloc.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -440,4 +440,24 @@ test('relocalización: datos de otra habitación no dan un candidato válido', (
   });
   // una pared plana encaja en cualquier pared: debe marcarse ambiguo o no válido, nunca un acierto "claro"
   assert.ok(!r.ok || r.ambiguous, `aceptó sin ambigüedad: ${JSON.stringify(r.candidates[0] && { q: r.candidates[0].quality })}`);
+});
+
+test('coincidencia en vivo: la pose correcta coincide más que la girada 180°', () => {
+  const saved = new Fusion({ voxel: 0.03 });
+  scanRoom(saved);
+  const cloud = saved.surfaceCloud();
+  const A = yawMatrix(0.7, 0.4, 0, -0.3);                  // verdad: sesión -> guardado
+  const wrong = mul4(yawMatrix(Math.PI, 0.25, 0, -1.15), A); // misma habitación girada 180°
+  const Ainv = invertRigid(A);
+  let good = 0, bad = 0;
+  for (const yaw of [-0.6, 0, 0.6]) {
+    const Mw = pose(yaw, -0.3, 0.1, 1.3, -0.2);
+    const frame = frameOf(roomDepth(Mw), mul4(Ainv, Mw));
+    good += liveAgreement(cloud, frame, A).ratio;
+    bad += liveAgreement(cloud, frame, wrong).ratio;
+  }
+  good /= 3; bad /= 3;
+  console.log(`coincidencia en vivo: correcta ${(good * 100).toFixed(0)}%, girada 180° ${(bad * 100).toFixed(0)}%`);
+  assert.ok(good > 0.8, `la correcta debería coincidir: ${good}`);
+  assert.ok(bad < good - 0.3, `la girada debería coincidir claramente menos: ${bad}`);
 });
