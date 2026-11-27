@@ -77,7 +77,10 @@ public final class Glb {
     return b.array();
   }
 
-  /** Lee un .glb: una MeshPart por primitiva (aplica las matrices de los nodos de primer nivel). */
+  /**
+   * Lee un .glb: una MeshPart por primitiva, en coordenadas de mundo. Recorre la jerarquía de nodos
+   * desde la escena (GLTFExporter de la web exporta un grupo con hijos) componiendo matrix o TRS.
+   */
   @SuppressWarnings("unchecked")
   public static List<MeshPart> read(byte[] data) {
     ByteBuffer b = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
@@ -90,12 +93,32 @@ public final class Glb {
     List<Object> meshesL = (List<Object>) g.get("meshes");
     List<Object> nodesL = (List<Object>) g.get("nodes");
     List<MeshPart> out = new ArrayList<>();
-    long key = 0;
     if (nodesL == null) return out;
-    for (Object no : nodesL) {
-      Map<String, Object> node = (Map<String, Object>) no;
+    // Raíces: los nodos de la escena por defecto, o los que no son hijos de nadie.
+    List<Integer> roots = new ArrayList<>();
+    List<Object> scenes = (List<Object>) g.get("scenes");
+    if (scenes != null && !scenes.isEmpty()) {
+      int si = g.get("scene") instanceof Double ? ((Double) g.get("scene")).intValue() : 0;
+      for (Object o : (List<Object>) ((Map<String, Object>) scenes.get(si)).get("nodes")) roots.add(((Double) o).intValue());
+    } else {
+      boolean[] child = new boolean[nodesL.size()];
+      for (Object no : nodesL) {
+        Object ch = ((Map<String, Object>) no).get("children");
+        if (ch != null) for (Object c : (List<Object>) ch) child[((Double) c).intValue()] = true;
+      }
+      for (int i = 0; i < child.length; i++) if (!child[i]) roots.add(i);
+    }
+    List<Object[]> stack = new ArrayList<>(); // {índice, matriz del padre}
+    for (int r : roots) stack.add(new Object[] {r, null});
+    long key = 0;
+    while (!stack.isEmpty()) {
+      Object[] top = stack.remove(0); // en orden: las partes salen en el orden del archivo
+      Map<String, Object> node = (Map<String, Object>) nodesL.get((Integer) top[0]);
+      float[] local = nodeMatrix(node), parent = (float[]) top[1];
+      float[] mat = parent == null ? local : local == null ? parent : Mat4.mul(parent, local);
+      Object ch = node.get("children");
+      if (ch != null) for (Object c : (List<Object>) ch) stack.add(new Object[] {((Double) c).intValue(), mat});
       if (!node.containsKey("mesh")) continue;
-      float[] mat = nodeMatrix(node);
       Map<String, Object> mesh = (Map<String, Object>) meshesL.get(((Double) node.get("mesh")).intValue());
       for (Object po : (List<Object>) mesh.get("primitives")) {
         Map<String, Object> prim = (Map<String, Object>) po;
@@ -121,6 +144,11 @@ public final class Glb {
           for (int i = 0; i < nv; i++) {
             Mat4.transform(mat, pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], p3);
             System.arraycopy(p3, 0, pos, i * 3, 3);
+            // normales: solo la parte lineal, renormalizadas (válido para rotación + escala uniforme)
+            float nx = nor[i * 3], ny = nor[i * 3 + 1], nz = nor[i * 3 + 2];
+            float x = mat[0] * nx + mat[4] * ny + mat[8] * nz, y = mat[1] * nx + mat[5] * ny + mat[9] * nz, z = mat[2] * nx + mat[6] * ny + mat[10] * nz;
+            float len = (float) Math.sqrt(x * x + y * y + z * z);
+            if (len > 0) { nor[i * 3] = x / len; nor[i * 3 + 1] = y / len; nor[i * 3 + 2] = z / len; }
           }
         }
         out.add(new MeshPart(key++, pos, nor, col, idx));
@@ -137,13 +165,27 @@ public final class Glb {
       for (int i = 0; i < 16; i++) m[i] = ((Double) l.get(i)).floatValue();
       return m;
     }
+    if (!node.containsKey("translation") && !node.containsKey("rotation") && !node.containsKey("scale")) return null;
+    float tx = 0, ty = 0, tz = 0, qx = 0, qy = 0, qz = 0, qw = 1, sx = 1, sy = 1, sz = 1;
     if (node.containsKey("translation")) {
       List<Object> l = (List<Object>) node.get("translation");
-      float[] m = Mat4.identity();
-      for (int i = 0; i < 3; i++) m[12 + i] = ((Double) l.get(i)).floatValue();
-      return m;
+      tx = ((Double) l.get(0)).floatValue(); ty = ((Double) l.get(1)).floatValue(); tz = ((Double) l.get(2)).floatValue();
     }
-    return null;
+    if (node.containsKey("rotation")) {
+      List<Object> l = (List<Object>) node.get("rotation");
+      qx = ((Double) l.get(0)).floatValue(); qy = ((Double) l.get(1)).floatValue(); qz = ((Double) l.get(2)).floatValue(); qw = ((Double) l.get(3)).floatValue();
+    }
+    if (node.containsKey("scale")) {
+      List<Object> l = (List<Object>) node.get("scale");
+      sx = ((Double) l.get(0)).floatValue(); sy = ((Double) l.get(1)).floatValue(); sz = ((Double) l.get(2)).floatValue();
+    }
+    // T * R * S, column-major
+    float[] m = new float[16];
+    m[0] = (1 - 2 * (qy * qy + qz * qz)) * sx; m[1] = 2 * (qx * qy + qz * qw) * sx; m[2] = 2 * (qx * qz - qy * qw) * sx;
+    m[4] = 2 * (qx * qy - qz * qw) * sy; m[5] = (1 - 2 * (qx * qx + qz * qz)) * sy; m[6] = 2 * (qy * qz + qx * qw) * sy;
+    m[8] = 2 * (qx * qz + qy * qw) * sz; m[9] = 2 * (qy * qz - qx * qw) * sz; m[10] = (1 - 2 * (qx * qx + qy * qy)) * sz;
+    m[12] = tx; m[13] = ty; m[14] = tz; m[15] = 1;
+    return m;
   }
 
   @SuppressWarnings("unchecked")

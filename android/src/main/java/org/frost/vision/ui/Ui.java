@@ -111,6 +111,8 @@ final class Ui {
   }
 
   static String meters(float m) {
+    m = Math.round(m * 100) / 100f;
+    if (m == 0) m = 0; // sin «-0,00»
     return String.format(java.util.Locale.US, "%.2f m", m).replace('.', ',');
   }
 }

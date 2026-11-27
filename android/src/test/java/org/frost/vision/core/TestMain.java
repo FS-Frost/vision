@@ -39,6 +39,7 @@ public final class TestMain {
     test("metadatos y .html compartido: ida y vuelta", TestMain::metaShare);
     test("simplificación: menos triángulos, misma superficie, sin degenerados", TestMain::simplify);
     test("sugerencia de anclas: esquina buena, pared lisa no", TestMain::anchorHint);
+    test("GLB de la web (GLTFExporter de three.js): jerarquía de nodos", TestMain::webGlb);
     test("registro de frames: escribir y leer da la misma malla", TestMain::frameLog);
     System.out.println();
     System.out.println("pasaron " + passed + ", fallaron " + failed);
@@ -525,5 +526,30 @@ public final class TestMain {
     System.out.printf("     anclas: esquina residuo %.1f cm (nivel %.0f), pared %.2f cm (nivel %.0f)%n", c[1] * 100, c[0], w[1] * 100, w[0]);
     check(c[0] == AnchorHint.GOOD, "la esquina debería ser buena");
     check(w[0] == AnchorHint.FLAT, "la pared lisa no");
+  }
+
+  /**
+   * src/test/resources/web-exporter.glb lo generó GLTFExporter (three 0.180.0) igual que el escáner
+   * web: un grupo trasladado (0, 0.25, 0) con dos cuadros de 1 m en z = -1, el segundo trasladado 0.5
+   * en x; colores lineales rojo (0.8, 0.05, 0.05) y verde (0.05, 0.6, 0.1).
+   */
+  static void webGlb() throws Exception {
+    byte[] data = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get("src/test/resources/web-exporter.glb"));
+    List<MeshPart> parts = Glb.read(data);
+    check(parts.size() == 2, "partes " + parts.size());
+    float minX = 9, maxX = -9, minY = 9, maxY = -9;
+    boolean red = false, green = false;
+    for (MeshPart m : parts) {
+      check(m.triangleCount() == 2, "triángulos");
+      for (int i = 0; i < m.vertexCount(); i++) {
+        minX = Math.min(minX, m.positions[i * 3]); maxX = Math.max(maxX, m.positions[i * 3]);
+        minY = Math.min(minY, m.positions[i * 3 + 1]); maxY = Math.max(maxY, m.positions[i * 3 + 1]);
+        check(Math.abs(m.positions[i * 3 + 2] + 1) < 1e-6 && Math.abs(m.normals[i * 3 + 2] - 1) < 1e-6, "z y normal");
+      }
+      red |= Math.abs(m.colors[0] - 0.8f) < 1e-6; green |= Math.abs(m.colors[1] - 0.6f) < 1e-6;
+    }
+    check(Math.abs(minX) < 1e-6 && Math.abs(maxX - 2.5f) < 1e-6, "x con la traslación del hijo: " + minX + ".." + maxX);
+    check(Math.abs(minY - 0.25f) < 1e-6 && Math.abs(maxY - 1.25f) < 1e-6, "y con la traslación del padre: " + minY + ".." + maxY);
+    check(red && green, "colores");
   }
 }

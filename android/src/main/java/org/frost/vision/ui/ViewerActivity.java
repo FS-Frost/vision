@@ -148,7 +148,7 @@ public final class ViewerActivity extends Activity implements GLSurfaceView.Rend
         meshes = parts;
         if (renderer != null) renderer.enqueue(parts);
         int ft = tris;
-        runOnUiThread(() -> info.setText(String.format(java.util.Locale.US, "%,d triángulos · suelo %s", ft, Ui.meters(fy)).replace(',', '.')
+        runOnUiThread(() -> info.setText(String.format(java.util.Locale.US, "%,d", ft).replace(',', '.') + " triángulos · suelo " + Ui.meters(fy)
             + (meta.imported ? " · importado (solo ver)" : "")));
       } catch (Exception e) {
         runOnUiThread(() -> info.setText("No se pudo cargar la malla: " + e.getMessage()));
