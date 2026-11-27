@@ -145,7 +145,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
   private TextView anchorText;
   private Overlays.Crosshair cross;
   private Overlays.Coverage coverage;
-  private Button btnAnchor, btnRecord, btnColor, btnFinish;
+  private Button btnAnchor, btnRecord, btnColor, btnFinish, btnTorch;
+  private boolean torch;
 
   @Override
   protected void onCreate(Bundle state) {
@@ -243,7 +244,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     btnRecord = Ui.button(this, recording ? "Parar" : "Grabar", recording ? Ui.DANGER : Ui.BTN, v -> toggleRecording());
     btnFinish = Ui.button(this, "Terminar", Ui.ACCENT, v -> finishScan());
     if (playback != null) btnRecord.setEnabled(false);
-    setBar(btnAnchor, btnColor, null, btnRecord, btnFinish);
+    btnTorch = Ui.button(this, torch ? "Apagar luz" : "Linterna", Ui.BTN, v -> toggleTorch());
+    setBar(btnAnchor, btnColor, btnTorch, null, btnRecord, btnFinish);
     cross.setVisibility(View.VISIBLE);
   }
 
@@ -944,6 +946,21 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
         showScanningBar();
       });
     });
+  }
+
+  /** Linterna (ARCore FlashMode.TORCH): habitaciones con poca luz, donde ARCore pierde el tracking. */
+  private void toggleTorch() {
+    Session s = session;
+    if (s == null) return;
+    try {
+      Config cfg = s.getConfig();
+      cfg.setFlashMode(torch ? Config.FlashMode.OFF : Config.FlashMode.TORCH);
+      s.configure(cfg);
+      torch = !torch;
+      if (btnTorch != null) btnTorch.setText(torch ? "Apagar luz" : "Linterna");
+    } catch (Exception e) {
+      toast("Linterna no disponible: " + e.getMessage());
+    }
   }
 
   // ---------------------------------------------------------------- grabación
