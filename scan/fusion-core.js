@@ -589,6 +589,60 @@ export class Fusion {
     };
   }
 
+  /**
+   * Nube de superficie (vértices submuestreados a 5 cm, con normales): { pos, nor, n }.
+   * Se cachea; `fresh` la recalcula (p. ej. tras integrar más frames).
+   */
+  surfaceCloud(fresh = false) {
+    if (fresh) this._target = null;
+    return this._targetCloud();
+  }
+
+  /**
+   * Calidad de una pose candidata (yaw, t) de la nube `src` (con normales `srcNor`) contra la
+   * malla de esta Fusion: fracción de puntos a < 2 cm de la superficie Y con normal compatible
+   * (coseno > 0.8). A diferencia del rms de alignPoints, sí distingue una pared encajada en
+   * el sitio correcto de una que solo "cae cerca".
+   */
+  scorePose(src, srcNor, yaw, t) {
+    const T = this._targetCloud();
+    if (!T.grid5) {
+      const G = 0.05, cells = new Map();
+      for (let i = 0; i < T.n; i++) {
+        const key = gridKey(Math.floor(T.pos[i * 3] / G), Math.floor(T.pos[i * 3 + 1] / G), Math.floor(T.pos[i * 3 + 2] / G));
+        let l = cells.get(key);
+        if (!l) { l = []; cells.set(key, l); }
+        l.push(i);
+      }
+      T.grid5 = { G, cells };
+    }
+    const { G, cells } = T.grid5;
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const n = src.length / 3;
+    let good = 0;
+    for (let i = 0; i < n; i++) {
+      const px = src[i * 3], py = src[i * 3 + 1], pz = src[i * 3 + 2];
+      const qx = c * px + s * pz + t[0], qy = py + t[1], qz = -s * px + c * pz + t[2];
+      const nx = c * srcNor[i * 3] + s * srcNor[i * 3 + 2], ny = srcNor[i * 3 + 1], nz = -s * srcNor[i * 3] + c * srcNor[i * 3 + 2];
+      const cx = Math.floor(qx / G), cy = Math.floor(qy / G), cz = Math.floor(qz / G);
+      let best = -1, bd = G * G;
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+        const l = cells.get(gridKey(cx + dx, cy + dy, cz + dz));
+        if (!l) continue;
+        for (const j of l) {
+          const ex = T.pos[j * 3] - qx, ey = T.pos[j * 3 + 1] - qy, ez = T.pos[j * 3 + 2] - qz;
+          const d2 = ex * ex + ey * ey + ez * ez;
+          if (d2 < bd) { bd = d2; best = j; }
+        }
+      }
+      if (best < 0) continue;
+      const tnx = T.nor[best * 3], tny = T.nor[best * 3 + 1], tnz = T.nor[best * 3 + 2];
+      const r = tnx * (qx - T.pos[best * 3]) + tny * (qy - T.pos[best * 3 + 1]) + tnz * (qz - T.pos[best * 3 + 2]);
+      if (Math.abs(r) < 0.02 && nx * tnx + ny * tny + nz * tnz > 0.8) good++;
+    }
+    return n ? good / n : 0;
+  }
+
   stats() {
     let vertices = 0, triangles = 0;
     for (const m of this.blockMeshes.values()) {

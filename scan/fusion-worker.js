@@ -1,28 +1,27 @@
 // Web Worker: recibe mapas de profundidad (+ color) y poses, fusiona y devuelve mallas por supercelda.
-// También guarda/carga el volumen TSDF y alinea una sesión nueva con un escaneo guardado.
-// El worker no ve el import map de la página: importa el núcleo con su misma versión (?v=...)
+// También guarda/carga el volumen TSDF y relocaliza una sesión nueva dentro de un escaneo guardado.
+//
+// El worker no ve el import map de la página: importa sus módulos con su misma versión (?v=...)
 // para no mezclar módulos de deploys distintos que estén en caché.
-let Fusion;
-const ready = import(`./fusion-core.js${self.location.search}`).then((m) => {
-  Fusion = m.Fusion;
+let Fusion, reloc;
+const V = self.location.search;
+const ready = Promise.all([import(`./fusion-core.js${V}`), import(`./reloc.js${V}`)]).then(([core, r]) => {
+  Fusion = core.Fusion;
+  reloc = r;
   fusion = new Fusion();
 });
 
 const MESH_INTERVAL_MS = 250;
 const MESH_BUDGET_MS = 30;
-const ALIGN_MIN_FRAMES = 5;   // frames acumulados antes de intentar alinear
-const ALIGN_WINDOW = 10;      // ventana deslizante de frames para alinear
-const ALIGN_OPTS = { minRatio: 0.35, maxRms: 0.025 };
-const AGREE_YAW = 0.02;       // rad: dos soluciones consecutivas deben coincidir
-const AGREE_T = 0.03;         // m
+const RELOC_MAX_FRAMES = 150;   // frames del barrido guardados para integrarlos al confirmar
+const RELOC_VIS_FRAMES = 20;    // frames usados en la prueba de visibilidad
 
 let fusion = null;
 let lastMesh = 0;
-let alignFrames = [];
-let alignAttempts = 0;
-let candidate = null;         // última solución "ok" aún no confirmada
-
-const agrees = (a, b) => Math.abs(a.yaw - b.yaw) < AGREE_YAW && Math.hypot(a.t[0] - b.t[0], a.t[1] - b.t[1], a.t[2] - b.t[2]) < AGREE_T;
+// relocalización: mini-escaneo provisional del barrido (marco de la sesión) + frames guardados
+let relocFusion = null;
+let relocFrames = [];
+let relocFloorFallback = null;
 
 function send(type, extra, meshes = []) {
   const transfer = [];
@@ -39,7 +38,12 @@ function frameFrom(m) {
   };
 }
 
-// los mensajes que llegan antes de cargar el núcleo esperan en orden (misma promesa)
+function resetReloc() {
+  relocFusion = null;
+  relocFrames = [];
+}
+
+// los mensajes que llegan antes de cargar los módulos esperan en orden (misma promesa)
 self.onmessage = (ev) => {
   ready.then(() => handle(ev.data)).catch((err) => {
     self.postMessage({ type: 'error', message: `carga del núcleo: ${err.message}` });
@@ -52,9 +56,8 @@ function handle(m) {
       case 'reset':
         fusion = new Fusion(m.options ?? fusion.opts);
         lastMesh = 0;
-        alignFrames = [];
-        alignAttempts = 0;
-        candidate = null;
+        resetReloc();
+        relocFloorFallback = m.sessionFloorFallback ?? null;
         if (m.volume) fusion.importVolume(m.volume);
         send('reset', { imported: !!m.volume });
         break;
@@ -72,40 +75,54 @@ function handle(m) {
         break;
       }
 
-      case 'align-frame': {
-        // acumula puntos de la sesión nueva; cuando hay suficientes, intenta alinear
-        alignFrames.push(fusion.samplePoints(frameFrom(m), 4));
-        if (alignFrames.length > ALIGN_WINDOW) alignFrames.shift();
-        if (alignFrames.length < ALIGN_MIN_FRAMES) {
-          self.postMessage({ type: 'aligning', frames: alignFrames.length, needed: ALIGN_MIN_FRAMES });
-          break;
-        }
-        const total = alignFrames.reduce((s, a) => s + a.length, 0);
-        const pts = new Float32Array(total);
-        let o = 0;
-        for (const a of alignFrames) { pts.set(a, o); o += a.length; }
+      case 'reloc-frame': {
+        // barrido: integra en el mini-escaneo provisional y guarda el frame para después
+        if (!relocFusion) relocFusion = new Fusion({ voxel: 0.05, minWeight: 1 });
+        const f = frameFrom(m);
+        relocFusion.integrate(f);
+        relocFrames.push(f);
+        if (relocFrames.length > RELOC_MAX_FRAMES) relocFrames.shift();
+        self.postMessage({ type: 'reloc-progress', frames: relocFrames.length });
+        break;
+      }
+
+      case 'reloc-solve': {
         const t0 = performance.now();
-        // con un candidato: refinar desde él con una sola semilla (rápido); si no, búsqueda multi-yaw
-        const r = candidate
-          ? fusion.alignPoints(pts, { ...ALIGN_OPTS, yaws: [0], initial: [candidate.yaw, ...candidate.t], levels: [0.2, 0.12, 0.08, 0.05] })
-          : fusion.alignPoints(pts, ALIGN_OPTS);
-        alignAttempts++;
-        // aceptar sólo si dos soluciones consecutivas coinciden (evita falsos positivos)
-        let ok = false;
-        if (r.ok) {
-          ok = !!candidate && agrees(candidate, r);
-          candidate = r;
-        } else {
-          candidate = null;
-        }
-        if (ok) fusion.setAlign(r.matrix);
+        if (!relocFusion) { self.postMessage({ type: 'reloc-result', ok: false, candidates: [], reason: 'sin barrido' }); break; }
+        // nube fresca: entre intentos el barrido sigue sumando frames
+        const sc = relocFusion.surfaceCloud(true);
+        const step = Math.max(1, Math.floor(relocFrames.length / RELOC_VIS_FRAMES));
+        const r = reloc.relocalize(fusion.surfaceCloud(), sc, {
+          refine: (init) => fusion.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
+          score: (yaw, t) => fusion.scorePose(sc.pos, sc.nor, yaw, t),
+          frames: relocFrames.filter((_, i) => i % step === 0),
+          sessionFloorFallback: relocFloorFallback,
+        });
         self.postMessage({
-          type: 'aligned', ok, candidate: r.ok && !ok, matrix: r.matrix, yaw: r.yaw, t: r.t,
-          inlierRatio: r.inlierRatio, rms: r.rms, reason: r.reason, attempts: alignAttempts,
-          ms: performance.now() - t0,
+          type: 'reloc-result', ok: r.ok, ambiguous: r.ambiguous, reason: r.reason, ms: performance.now() - t0,
+          candidates: r.candidates.slice(0, 5).map((c) => ({
+            matrix: Array.from(c.matrix), yaw: c.yaw, t: c.t, quality: c.quality, visibility: c.visibility, rank: c.rank,
+          })),
         });
         break;
       }
+
+      case 'reloc-confirm': {
+        // el usuario confirmó visualmente: fijar alineación e integrar todo el barrido
+        const t0 = performance.now();
+        fusion.setAlign(m.matrix);
+        for (const f of relocFrames) fusion.integrate(f);
+        const n = relocFrames.length;
+        resetReloc();
+        const meshes = fusion.extract(Infinity).meshes;
+        lastMesh = performance.now();
+        send('reloc-confirmed', { frames: n, ms: performance.now() - t0 }, meshes);
+        break;
+      }
+
+      case 'reloc-reset':
+        resetReloc();
+        break;
 
       case 'flush': {
         // malla final completa y limpia (al cerrar la sesión); reemplaza todo

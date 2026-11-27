@@ -11,7 +11,13 @@ import * as db from './db.js';
 
 const params = new URLSearchParams(location.search);
 const SEND_INTERVAL_MS = 1000 / (parseFloat(params.get('hz')) || 10);
-const ALIGN_INTERVAL_MS = 250;
+// relocalización (continuar un escaneo desde cualquier punto de la habitación)
+const RELOC_INTERVAL_MS = 200;     // frames del barrido a ~5 Hz
+const SWEEP_MIN_MS = 6000;         // barrido mínimo antes de buscar
+const SWEEP_MAX_MS = 15000;        // buscar igualmente pasado este tiempo
+const SWEEP_COVERAGE = 0.5;        // fracción de direcciones cubiertas (bins de 15°) para buscar antes
+const RESOLVE_EVERY_MS = 5000;     // si no encontró, reintentar tras este tiempo de barrido extra
+const SWEEP_BINS = 24;
 const COLOR_TOP_DOWN = params.get('colorTopDown') === '1';
 const COLOR_WIDTH = 120;   // ancho de la imagen de color leída de la GPU
 const EYE_HEIGHT = 1.5;    // m sobre el suelo en modo paseo (máximo)
@@ -26,6 +32,8 @@ const ui = {
   walk: $('#btn-walk'), shade: $('#btn-shade'), cont: $('#btn-continue'), share: $('#btn-share'),
   exportBtn: $('#btn-export'), homeBtn: $('#btn-home'), newBtn: $('#btn-new'),
   overlay: $('#overlay'), hud: $('#hud'), hint: $('#hint'), pause: $('#btn-pause'), stop: $('#btn-stop'),
+  relocBar: $('#reloc-bar'), relocText: $('#reloc-text'), relocOk: $('#btn-reloc-ok'),
+  relocOther: $('#btn-reloc-other'), relocRetry: $('#btn-reloc-retry'),
   joy: $('#joy'), joyKnob: $('#joy-knob'), walkHint: $('#walk-hint'),
   walkBar: $('#walk-bar'), walkExit: $('#btn-walk-exit'), collide: $('#btn-collide'),
 };
@@ -54,8 +62,7 @@ const state = window.vision = {
   hasColor: false,
   meta: null,            // escaneo mostrado: { id, name, createdAt, voxel, hasVolume }
   continuing: false,     // sesión actual continúa un escaneo guardado
-  aligning: false,
-  align: null,           // último resultado de alineación
+  reloc: null,           // { phase: sweep|solving|confirm|confirming|done, ... } al continuar
   volume: null,          // TSDF exportado al terminar
   walking: false,
   errors: [],
@@ -174,19 +181,17 @@ worker.onmessage = (ev) => {
       state.integrateMs = m.integrateMs;
       state.meshMs = m.meshMs;
       break;
-    case 'aligning':
+    case 'reloc-progress':
       workerBusy = false;
-      state.align = { pending: true, frames: m.frames, needed: m.needed };
+      if (state.reloc) state.reloc.frames = m.frames;
       break;
-    case 'aligned':
+    case 'reloc-result':
       workerBusy = false;
-      state.align = m;
-      if (m.ok) {
-        state.aligning = false;
-        // la malla guardada está en el marco guardado; para verla en la sesión: inversa
-        setWorldMatrix(new THREE.Matrix4().fromArray(m.matrix).invert().toArray());
-        world.visible = true;
-      }
+      onRelocResult(m);
+      break;
+    case 'reloc-confirmed':
+      workerBusy = false;
+      if (state.reloc) Object.assign(state.reloc, { phase: 'done', integrated: m.frames });
       break;
     case 'flushed':
       state.meshMs = m.meshMs;
@@ -260,17 +265,25 @@ async function startScan(continueFrom = null) {
       return;
     }
   }
+  const features = session.enabledFeatures ?? [];
+  state.refSpace = features.includes('local-floor') ? 'local-floor' : 'local';
   const voxel = volume?.voxel ?? (parseFloat(ui.quality.value) || 0.03);
-  worker.postMessage({ type: 'reset', options: { voxel, colorTopDown: COLOR_TOP_DOWN }, volume });
+  worker.postMessage({
+    type: 'reset', options: { voxel, colorTopDown: COLOR_TOP_DOWN }, volume,
+    // si el barrido no ve el suelo, con local-floor el suelo de la sesión está en y = 0
+    sessionFloorFallback: state.refSpace === 'local-floor' ? 0 : null,
+  });
   workerBusy = false;
   stopWalking();
   if (!continueFrom) { clearWorld(); state.meta = null; }
   setWorldMatrix(null);
-  world.visible = !continueFrom; // la malla guardada se muestra cuando la sesión esté alineada
+  world.visible = !continueFrom; // la malla guardada se muestra al proponer una posición
   Object.assign(state, {
     mode: 'scan', paused: false, sent: 0, dropped: 0, colorFrames: 0, fusion: null,
-    continuing: !!continueFrom, aligning: !!continueFrom, align: null, volume: null,
+    continuing: !!continueFrom, volume: null,
+    reloc: continueFrom ? newReloc() : null,
   });
+  ui.relocBar.hidden = true;
   ui.pause.textContent = 'Pausar';
   ui.sheet.hidden = true;
   ui.overlay.hidden = false;
@@ -278,8 +291,6 @@ async function startScan(continueFrom = null) {
   if (grid) grid.visible = false;
   setMaterial(materials.ar);
 
-  const features = session.enabledFeatures ?? [];
-  state.refSpace = features.includes('local-floor') ? 'local-floor' : 'local';
   renderer.xr.setReferenceSpaceType(state.refSpace);
   session.addEventListener('end', onSessionEnd);
   await renderer.xr.setSession(session);
@@ -287,6 +298,7 @@ async function startScan(continueFrom = null) {
 
 async function onSessionEnd() {
   ui.overlay.hidden = true;
+  ui.relocBar.hidden = true;
   setWorldMatrix(null);
   world.visible = true;
   state.mode = 'view';
@@ -294,11 +306,13 @@ async function onSessionEnd() {
   ui.viewerText.textContent = 'Cerrando la malla y limpiando fragmentos.';
   showSheet('viewer');
 
-  if (state.continuing && state.aligning) {
-    // nunca se alineó: no se integró nada, se deja el escaneo como estaba
-    state.continuing = state.aligning = false;
+  if (state.continuing && state.reloc?.phase !== 'done') {
+    // nunca se confirmó la posición: no se integró nada, se deja el escaneo como estaba
+    worker.postMessage({ type: 'reloc-reset' });
+    state.continuing = false;
+    state.reloc = null;
     showViewer(state.meta);
-    ui.viewerText.textContent = 'No se logró alinear con el escaneo guardado; no se modificó.';
+    ui.viewerText.textContent = 'No se confirmó la posición en el escaneo guardado; no se modificó.';
     return;
   }
   await new Promise((res) => { flushResolve = res; worker.postMessage({ type: 'flush' }); });
@@ -350,7 +364,10 @@ function onXRFrame(time, frame) {
   const pose = frame.getViewerPose(renderer.xr.getReferenceSpace());
   if (!pose || pose.emulatedPosition) { state.tracking = 'perdido'; return; }
   state.tracking = 'ok';
-  const interval = state.aligning ? ALIGN_INTERVAL_MS : SEND_INTERVAL_MS;
+  const rl = state.continuing ? state.reloc : null;
+  if (rl && rl.phase === 'sweep') updateSweepCoverage(pose.transform.orientation);
+  if (rl && rl.phase !== 'sweep' && rl.phase !== 'done') return; // buscando o esperando confirmación
+  const interval = rl && rl.phase === 'sweep' ? RELOC_INTERVAL_MS : SEND_INTERVAL_MS;
   if (state.paused || time - lastSend < interval) return;
   if (workerBusy) { state.dropped++; return; }
 
@@ -367,18 +384,27 @@ function onXRFrame(time, frame) {
   workerBusy = true;
   lastSend = time;
 
-  if (state.aligning) {
-    const { msg, transfer } = depthMessage('align-frame', frame, view, di);
-    worker.postMessage(msg, transfer);
-    return;
-  }
+  const sweeping = rl && rl.phase === 'sweep';
+  const { msg, transfer } = depthMessage(sweeping ? 'reloc-frame' : 'integrate', frame, view, di);
+  if (!sweeping) state.sent++;
+  // tras el frame, ¿toca buscar? (se decide ahora para que 'reloc-solve' vaya justo detrás)
+  const solve = sweeping && shouldSolve();
+  if (solve) rl.phase = 'solving';
+  sendWithColor(msg, transfer, view).then(() => {
+    if (!solve) return;
+    rl.lastSolveAt = performance.now();
+    rl.attempts++;
+    workerBusy = true;
+    worker.postMessage({ type: 'reloc-solve' });
+  });
+}
 
-  const { msg, transfer } = depthMessage('integrate', frame, view, di);
-  state.sent++;
+/** Envía el frame al worker con la imagen de color si está disponible. */
+function sendWithColor(msg, transfer, view) {
   let colorPromise = null;
   try { colorPromise = grabCameraColor(view); } catch (err) { logError('color', err); }
-  if (!colorPromise) { worker.postMessage(msg, transfer); return; }
-  colorPromise
+  if (!colorPromise) { worker.postMessage(msg, transfer); return Promise.resolve(); }
+  return colorPromise
     .then((c) => {
       msg.color = c.buf.buffer; msg.colorWidth = c.w; msg.colorHeight = c.h;
       transfer.push(c.buf.buffer);
@@ -386,6 +412,65 @@ function onXRFrame(time, frame) {
     })
     .catch((err) => logError('color', err))
     .finally(() => worker.postMessage(msg, transfer));
+}
+
+// ---------------------------------------------------------------- relocalización (continuar)
+
+function newReloc() {
+  return {
+    phase: 'sweep', startedAt: performance.now(), lastSolveAt: 0, attempts: 0, frames: 0,
+    bins: new Uint8Array(SWEEP_BINS), coverage: 0, candidates: [], idx: 0, result: null, integrated: 0,
+  };
+}
+
+/** Marca qué direcciones horizontales ha mirado la cámara durante el barrido. */
+function updateSweepCoverage(q) {
+  const rl = state.reloc;
+  // dirección de vista = (0, 0, -1) rotado por el cuaternión
+  const fx = -2 * (q.x * q.z + q.w * q.y);
+  const fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+  if (Math.hypot(fx, fz) < 0.3) return; // mirando casi vertical
+  const a = Math.atan2(fx, -fz);
+  const bin = Math.floor(((a + Math.PI) / (2 * Math.PI)) * SWEEP_BINS) % SWEEP_BINS;
+  rl.bins[bin] = 1;
+  rl.coverage = rl.bins.reduce((acc, v) => acc + v, 0) / SWEEP_BINS;
+}
+
+function shouldSolve() {
+  const rl = state.reloc;
+  const now = performance.now();
+  if (rl.frames < 10) return false;
+  if (rl.attempts > 0) return now - rl.lastSolveAt >= RESOLVE_EVERY_MS;
+  const elapsed = now - rl.startedAt;
+  return (elapsed >= SWEEP_MIN_MS && rl.coverage >= SWEEP_COVERAGE) || elapsed >= SWEEP_MAX_MS;
+}
+
+function onRelocResult(m) {
+  const rl = state.reloc;
+  if (!rl) return;
+  rl.result = { ok: m.ok, ambiguous: m.ambiguous, reason: m.reason, ms: Math.round(m.ms), n: m.candidates.length };
+  if (!m.ok || !m.candidates.length) {
+    rl.phase = 'sweep'; // seguir barriendo y reintentar
+    return;
+  }
+  rl.phase = 'confirm';
+  rl.candidates = m.candidates;
+  showCandidate(0);
+}
+
+function showCandidate(i) {
+  const rl = state.reloc;
+  rl.idx = i;
+  const c = rl.candidates[i];
+  // la malla guardada está en el marco guardado; para verla en la sesión: inversa
+  setWorldMatrix(new THREE.Matrix4().fromArray(c.matrix).invert().toArray());
+  world.visible = true;
+  ui.relocText.textContent =
+    `¿La malla azul coincide con la realidad? Posición ${i + 1} de ${rl.candidates.length}` +
+    ` · coincidencia ${Math.round(c.quality * 100)}%` +
+    (rl.result?.ambiguous ? ' · hay otra posición parecida: compruébalo bien' : '');
+  ui.relocOther.hidden = rl.candidates.length < 2;
+  ui.relocBar.hidden = false;
 }
 
 const clock = new THREE.Clock();
@@ -648,11 +733,17 @@ setInterval(() => {
   if (state.mode !== 'scan') return;
   const f = state.fusion;
   let alignLine = '';
-  if (state.continuing) {
-    const a = state.align;
-    alignLine = state.aligning
-      ? `alineando… ${a?.pending ? `${a.frames}/${a.needed} frames` : a ? `intento ${a.attempts}: ${Math.round((a.inlierRatio ?? 0) * 100)}% coincide${a.candidate ? ', confirmando' : ''}` : ''}`
-      : `alineado ✓ ${a ? `${Math.round(a.inlierRatio * 100)}% · ${(a.rms * 100).toFixed(1)} cm` : ''} · solo zonas nuevas`;
+  if (state.continuing && state.reloc) {
+    const rl = state.reloc;
+    const secs = ((performance.now() - rl.startedAt) / 1000).toFixed(0);
+    alignLine = {
+      sweep: `barrido: ${Math.round(rl.coverage * 100)}% de giro · ${rl.frames} frames · ${secs}s` +
+        (rl.result && !rl.result.ok ? `\nsin coincidencia (${rl.result.reason ?? '?'}): sigue girando` : ''),
+      solving: 'buscando en toda la habitación…',
+      confirm: `¿coincide? posición ${rl.idx + 1}/${rl.candidates.length}${rl.result ? ` · búsqueda ${rl.result.ms} ms` : ''}`,
+      confirming: 'integrando el barrido…',
+      done: `alineado ✓ confirmado · solo zonas nuevas · ${rl.integrated} frames del barrido`,
+    }[rl.phase] ?? '';
   }
   ui.hud.textContent = [
     `fps ${state.fps}   tracking ${state.tracking}${state.paused ? '   PAUSA' : ''}`,
@@ -665,9 +756,9 @@ setInterval(() => {
   if (state.tracking !== 'ok') {
     ui.hint.hidden = false;
     ui.hint.textContent = 'Tracking perdido: mueve el teléfono despacio y apunta a zonas con textura';
-  } else if (state.aligning) {
+  } else if (state.continuing && state.reloc?.phase === 'sweep') {
     ui.hint.hidden = false;
-    ui.hint.textContent = 'Ponte donde empezaste el escaneo y apunta a zonas ya escaneadas';
+    ui.hint.textContent = 'Gira despacio sobre ti mismo mirando paredes y muebles';
   } else {
     ui.hint.hidden = true;
   }
@@ -678,6 +769,27 @@ setInterval(() => {
 ui.scan.addEventListener('click', () => startScan());
 ui.newBtn.addEventListener('click', () => startScan());
 ui.cont.addEventListener('click', () => state.meta && startScan(state.meta));
+ui.relocOk.addEventListener('click', () => {
+  const rl = state.reloc;
+  if (!rl || rl.phase !== 'confirm') return;
+  rl.phase = 'confirming';
+  ui.relocBar.hidden = true;
+  workerBusy = true;
+  worker.postMessage({ type: 'reloc-confirm', matrix: rl.candidates[rl.idx].matrix });
+});
+ui.relocOther.addEventListener('click', () => {
+  const rl = state.reloc;
+  if (rl?.phase === 'confirm') showCandidate((rl.idx + 1) % rl.candidates.length);
+});
+ui.relocRetry.addEventListener('click', () => {
+  const rl = state.reloc;
+  if (rl?.phase !== 'confirm') return;
+  // seguir barriendo (los frames acumulados se conservan) y volver a buscar más tarde
+  rl.phase = 'sweep';
+  rl.lastSolveAt = performance.now();
+  ui.relocBar.hidden = true;
+  world.visible = false;
+});
 ui.pause.addEventListener('click', () => {
   state.paused = !state.paused;
   ui.pause.textContent = state.paused ? 'Reanudar' : 'Pausar';

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Fusion, mul4, invertRigid, yawMatrix } from '../scan/fusion-core.js';
 import { Collider } from '../scan/collider.js';
+import { relocalize } from '../scan/reloc.js';
 
 const W = 160, H = 90;
 const F = 1 / Math.tan(Math.PI / 6); // fov vertical 60°
@@ -371,4 +372,72 @@ test('continuar: lo ya escaneado no cambia aunque la alineación tenga 5 cm de e
   console.log(`vértices originales intactos: congelado ${(frozen * 100).toFixed(1)}%, mezclado ${(mixed * 100).toFixed(1)}%`);
   assert.ok(frozen > 0.97, `congelado debería conservar el original: ${frozen}`);
   assert.ok(mixed < frozen - 0.1, `el control debería alterar el original: ${mixed}`);
+});
+
+// ---------------------------------------------------------------- relocalización global
+
+function relocTrial(saved, savedCloud, A, startX, startZ) {
+  // sesión nueva: barrido de 360° desde (startX, startZ); la sesión reporta poses en su propio marco
+  const Ainv = invertRigid(A);
+  const sess = new Fusion({ voxel: 0.05, minWeight: 1 });
+  const frames = [];
+  for (let yaw = 0; yaw < 2 * Math.PI; yaw += Math.PI / 8) {
+    for (const pitch of [-0.35, 0]) {
+      const Mw = pose(yaw, pitch, startX, 1.3, startZ);
+      const fr = frameOf(roomDepth(Mw), mul4(Ainv, Mw));
+      sess.integrate(fr);
+      frames.push(fr);
+    }
+  }
+  const sc = sess.surfaceCloud();
+  return relocalize(savedCloud, sc, {
+    refine: (init) => saved.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
+    score: (yaw, t) => saved.scorePose(sc.pos, sc.nor, yaw, t),
+    frames: frames.filter((_, i) => i % 2 === 0),
+  });
+}
+
+test('relocalización global: 20 inicios al azar (cualquier punto y giro)', () => {
+  const saved = new Fusion({ voxel: 0.03 });
+  scanRoom(saved);
+  const savedCloud = saved.surfaceCloud();
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  let ok = 0, top3 = 0;
+  const fails = [];
+  const t0 = performance.now();
+  for (let k = 0; k < 20; k++) {
+    // punto libre al azar dentro de la habitación (lejos de paredes y de la caja)
+    let x, z;
+    do { x = -1.1 + rnd() * 2.7; z = -2.1 + rnd() * 3.2; } while (x > 0 && x < 0.9 && z > -1.7 && z < -0.6);
+    const yawTrue = rnd() * 2 * Math.PI - Math.PI;
+    const A = yawMatrix(yawTrue, (rnd() - 0.5) * 2, (rnd() - 0.5) * 0.3, (rnd() - 0.5) * 2);
+    const r = relocTrial(saved, savedCloud, A, x, z);
+    const good = (c) => c && Math.abs(Math.atan2(Math.sin(c.yaw - yawTrue), Math.cos(c.yaw - yawTrue))) < 1 * Math.PI / 180 &&
+      Math.hypot(c.t[0] - A[12], c.t[1] - A[13], c.t[2] - A[14]) < 0.03;
+    if (r.ok && good(r.candidates[0])) ok++;
+    else fails.push({ k, best: r.candidates[0] && { q: +r.candidates[0].quality.toFixed(2), yaw: +r.candidates[0].yaw.toFixed(2) }, yawTrue: +yawTrue.toFixed(2) });
+    if (r.candidates.slice(0, 3).some(good)) top3++;
+  }
+  const ms = (performance.now() - t0) / 20;
+  console.log(`relocalización: ${ok}/20 primer candidato correcto, ${top3}/20 entre los 3 primeros, ${ms.toFixed(0)} ms por intento`, fails.length ? fails : '');
+  assert.ok(ok >= 18, `solo ${ok}/20 correctos`);
+});
+
+test('relocalización: datos de otra habitación no dan un candidato válido', () => {
+  const saved = new Fusion({ voxel: 0.03 });
+  scanRoom(saved);
+  // "otra habitación": una sola pared lejana y suelo, sin la geometría de la guardada
+  const other = new Fusion({ voxel: 0.05, minWeight: 1 });
+  for (let yaw = -0.6; yaw <= 0.6; yaw += 0.2) {
+    const M = pose(yaw, -0.3, 0, 1.3, 0);
+    other.integrate(frameOf(planeDepth(2.2), M));
+  }
+  const sc = other.surfaceCloud();
+  const r = relocalize(saved.surfaceCloud(), sc, {
+    refine: (init) => saved.alignPoints(sc.pos, { yaws: [0], initial: init, levels: [0.25, 0.15, 0.08, 0.05], itersPer: 4, minRatio: 0 }),
+    score: (yaw, t) => saved.scorePose(sc.pos, sc.nor, yaw, t),
+  });
+  // una pared plana encaja en cualquier pared: debe marcarse ambiguo o no válido, nunca un acierto "claro"
+  assert.ok(!r.ok || r.ambiguous, `aceptó sin ambigüedad: ${JSON.stringify(r.candidates[0] && { q: r.candidates[0].quality })}`);
 });

@@ -50,6 +50,8 @@
   #overlay .hud { align-self: flex-start; background: rgba(0,0,0,.55); border-radius: 10px; padding: 8px 10px;
     font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre; color: #fff; }
   #overlay .row { pointer-events: auto; justify-content: center; }
+  #reloc-bar { pointer-events: auto; align-self: stretch; background: rgba(0,0,0,.7); border-radius: 12px; padding: 10px; color: #fff; }
+  #reloc-text { margin-bottom: 8px; text-align: center; }
   #hint { align-self: center; background: rgba(0,0,0,.55); border-radius: 999px; padding: 6px 14px; color: #fff; text-align: center; }
 
   /* Joystick del modo paseo */
@@ -73,7 +75,8 @@
     "./collider.js": "./collider.js?v=__BUILD__",
     "./share.js": "./share.js?v=__BUILD__",
     "./db.js": "./db.js?v=__BUILD__",
-    "./fusion-core.js": "./fusion-core.js?v=__BUILD__"
+    "./fusion-core.js": "./fusion-core.js?v=__BUILD__",
+    "./reloc.js": "./reloc.js?v=__BUILD__"
   }
 }
 </script>
@@ -128,6 +131,14 @@
 <div id="overlay" hidden>
   <div class="hud" id="hud">Iniciando…</div>
   <div id="hint">Mueve el teléfono despacio</div>
+  <div id="reloc-bar" hidden>
+    <div id="reloc-text"></div>
+    <div class="row">
+      <button id="btn-reloc-ok">Coincide</button>
+      <button id="btn-reloc-other" class="secondary">Probar otra</button>
+      <button id="btn-reloc-retry" class="secondary">Seguir buscando</button>
+    </div>
+  </div>
   <div class="row">
     <button id="btn-pause" class="secondary">Pausar</button>
     <button id="btn-stop" class="danger">Terminar</button>
